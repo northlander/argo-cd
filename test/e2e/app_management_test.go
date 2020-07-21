@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"path"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -40,9 +41,57 @@ import (
 )
 
 const (
-	guestbookPath      = "guestbook"
-	guestbookPathLocal = "./testdata/guestbook_local"
+	guestbookPath          = "guestbook"
+	guestbookPathLocal     = "./testdata/guestbook_local"
+	globalWithNoNameSpace  = "global-with-no-namesapce"
+	guestbookWithNamespace = "guestbook-with-namespace"
 )
+
+func TestSyncToUnsignedCommit(t *testing.T) {
+	Given(t).
+		Project("gpg").
+		Path(guestbookPath).
+		When().
+		IgnoreErrors().
+		Create().
+		Sync().
+		Then().
+		Expect(OperationPhaseIs(OperationError)).
+		Expect(SyncStatusIs(SyncStatusCodeOutOfSync)).
+		Expect(HealthIs(health.HealthStatusMissing))
+}
+
+func TestSyncToSignedCommitWithoutKnownKey(t *testing.T) {
+	Given(t).
+		Project("gpg").
+		Path(guestbookPath).
+		When().
+		AddSignedFile("test.yaml", "null").
+		IgnoreErrors().
+		Create().
+		Sync().
+		Then().
+		Expect(OperationPhaseIs(OperationError)).
+		Expect(SyncStatusIs(SyncStatusCodeOutOfSync)).
+		Expect(HealthIs(health.HealthStatusMissing))
+}
+
+func TestSyncToSignedCommitKeyWithKnownKey(t *testing.T) {
+	Given(t).
+		Project("gpg").
+		Path(guestbookPath).
+		GPGPublicKeyAdded().
+		Sleep(2).
+		When().
+		AddSignedFile("test.yaml", "null").
+		IgnoreErrors().
+		Create().
+		Sync().
+		Then().
+		Expect(OperationPhaseIs(OperationSucceeded)).
+		Expect(SyncStatusIs(SyncStatusCodeSynced)).
+		Expect(HealthIs(health.HealthStatusHealthy))
+}
 
 func TestAppCreation(t *testing.T) {
 	ctx := Given(t)
@@ -289,7 +338,7 @@ func TestManipulateApplicationResources(t *testing.T) {
 		And(func(app *Application) {
 			manifests, err := RunCli("app", "manifests", app.Name, "--source", "live")
 			assert.NoError(t, err)
-			resources, err := kube.SplitYAML(manifests)
+			resources, err := kube.SplitYAML([]byte(manifests))
 			assert.NoError(t, err)
 
 			index := -1
@@ -440,7 +489,9 @@ func TestResourceDiffing(t *testing.T) {
 			assert.Contains(t, diffOutput, fmt.Sprintf("===== apps/Deployment %s/guestbook-ui ======", DeploymentNamespace()))
 		}).
 		Given().
-		ResourceOverrides(map[string]ResourceOverride{"apps/Deployment": {IgnoreDifferences: ` jsonPointers: ["/spec/template/spec/containers/0/image"]`}}).
+		ResourceOverrides(map[string]ResourceOverride{"apps/Deployment": {
+			IgnoreDifferences: OverrideIgnoreDiff{JSONPointers: []string{"/spec/template/spec/containers/0/image"}},
+		}}).
 		When().
 		Refresh(RefreshTypeNormal).
 		Then().
@@ -687,6 +738,26 @@ func TestNoLocalSyncWithAutosyncEnabled(t *testing.T) {
 		})
 }
 
+func TestLocalSyncDryRunWithAutosyncEnabled(t *testing.T) {
+	Given(t).
+		Path(guestbookPath).
+		When().
+		Create().
+		Sync().
+		Then().
+		And(func(app *Application) {
+			_, err := RunCli("app", "set", app.Name, "--sync-policy", "automated")
+			assert.NoError(t, err)
+
+			appBefore := app.DeepCopy()
+			_, err = RunCli("app", "sync", app.Name, "--dry-run", "--local", guestbookPathLocal)
+			assert.NoError(t, err)
+
+			appAfter := app.DeepCopy()
+			assert.True(t, reflect.DeepEqual(appBefore, appAfter))
+		})
+}
+
 func TestSyncAsync(t *testing.T) {
 	Given(t).
 		Path(guestbookPath).
@@ -860,7 +931,7 @@ func TestSelfManagedApps(t *testing.T) {
 
 			reconciledCount := 0
 			var lastReconciledAt *metav1.Time
-			for event := range ArgoCDClientset.WatchApplicationWithRetry(ctx, a.Name) {
+			for event := range ArgoCDClientset.WatchApplicationWithRetry(ctx, a.Name, a.ResourceVersion) {
 				reconciledAt := event.Application.Status.ReconciledAt
 				if reconciledAt == nil {
 					reconciledAt = &metav1.Time{}
@@ -938,6 +1009,58 @@ func TestOrphanedResource(t *testing.T) {
 		Refresh(RefreshTypeNormal).
 		Then().
 		Expect(Condition(ApplicationConditionOrphanedResourceWarning, "Application has 1 orphaned resources")).
+		And(func(app *Application) {
+			output, err := RunCli("app", "resources", app.Name)
+			assert.NoError(t, err)
+			assert.Contains(t, output, "orphaned-configmap")
+		}).
+		Given().
+		ProjectSpec(AppProjectSpec{
+			SourceRepos:       []string{"*"},
+			Destinations:      []ApplicationDestination{{Namespace: "*", Server: "*"}},
+			OrphanedResources: &OrphanedResourcesMonitorSettings{Warn: pointer.BoolPtr(true), Ignore: []OrphanedResourceKey{{Group: "Test", Kind: "ConfigMap"}}},
+		}).
+		When().
+		Refresh(RefreshTypeNormal).
+		Then().
+		Expect(Condition(ApplicationConditionOrphanedResourceWarning, "Application has 1 orphaned resources")).
+		And(func(app *Application) {
+			output, err := RunCli("app", "resources", app.Name)
+			assert.NoError(t, err)
+			assert.Contains(t, output, "orphaned-configmap")
+		}).
+		Given().
+		ProjectSpec(AppProjectSpec{
+			SourceRepos:       []string{"*"},
+			Destinations:      []ApplicationDestination{{Namespace: "*", Server: "*"}},
+			OrphanedResources: &OrphanedResourcesMonitorSettings{Warn: pointer.BoolPtr(true), Ignore: []OrphanedResourceKey{{Kind: "ConfigMap"}}},
+		}).
+		When().
+		Refresh(RefreshTypeNormal).
+		Then().
+		Expect(SyncStatusIs(SyncStatusCodeSynced)).
+		Expect(NoConditions()).
+		And(func(app *Application) {
+			output, err := RunCli("app", "resources", app.Name)
+			assert.NoError(t, err)
+			assert.NotContains(t, output, "orphaned-configmap")
+		}).
+		Given().
+		ProjectSpec(AppProjectSpec{
+			SourceRepos:       []string{"*"},
+			Destinations:      []ApplicationDestination{{Namespace: "*", Server: "*"}},
+			OrphanedResources: &OrphanedResourcesMonitorSettings{Warn: pointer.BoolPtr(true), Ignore: []OrphanedResourceKey{{Kind: "ConfigMap", Name: "orphaned-configmap"}}},
+		}).
+		When().
+		Refresh(RefreshTypeNormal).
+		Then().
+		Expect(SyncStatusIs(SyncStatusCodeSynced)).
+		Expect(NoConditions()).
+		And(func(app *Application) {
+			output, err := RunCli("app", "resources", app.Name)
+			assert.NoError(t, err)
+			assert.NotContains(t, output, "orphaned-configmap")
+		}).
 		Given().
 		ProjectSpec(AppProjectSpec{
 			SourceRepos:       []string{"*"},
@@ -1035,4 +1158,154 @@ func TestNotPermittedResources(t *testing.T) {
 	// Make sure prohibited resources are not deleted during application deletion
 	FailOnErr(KubeClientset.NetworkingV1beta1().Ingresses(ArgoCDNamespace).Get("sample-ingress", metav1.GetOptions{}))
 	FailOnErr(KubeClientset.CoreV1().Services(DeploymentNamespace()).Get("guestbook-ui", metav1.GetOptions{}))
+}
+
+func TestSyncWithInfos(t *testing.T) {
+	expectedInfo := make([]*Info, 2)
+	expectedInfo[0] = &Info{Name: "name1", Value: "val1"}
+	expectedInfo[1] = &Info{Name: "name2", Value: "val2"}
+
+	Given(t).
+		Path(guestbookPath).
+		When().
+		Create().
+		Then().
+		And(func(app *Application) {
+			_, err := RunCli("app", "sync", app.Name,
+				"--info", fmt.Sprintf("%s=%s", expectedInfo[0].Name, expectedInfo[0].Value),
+				"--info", fmt.Sprintf("%s=%s", expectedInfo[1].Name, expectedInfo[1].Value))
+			assert.NoError(t, err)
+		}).
+		Expect(SyncStatusIs(SyncStatusCodeSynced)).
+		And(func(app *Application) {
+			assert.ElementsMatch(t, app.Status.OperationState.Operation.Info, expectedInfo)
+		})
+}
+
+//Given: argocd app create does not provide --dest-namespace
+//       Manifest contains resource console which does not require namespace
+//Expect: no app.Status.Conditions
+func TestCreateAppWithNoNameSpaceForGlobalResourse(t *testing.T) {
+	Given(t).
+		Path(globalWithNoNameSpace).
+		When().
+		CreateWithNoNameSpace().
+		Then().
+		And(func(app *Application) {
+			time.Sleep(500 * time.Millisecond)
+			app, err := AppClientset.ArgoprojV1alpha1().Applications(ArgoCDNamespace).Get(app.Name, metav1.GetOptions{})
+			assert.NoError(t, err)
+			assert.Len(t, app.Status.Conditions, 0)
+		})
+}
+
+//Given: argocd app create does not provide --dest-namespace
+//       Manifest contains resource deployment, and service which requires namespace
+//       Deployment and service do not have namespace in manifest
+//Expect: app.Status.Conditions for deployment ans service which does not have namespace in manifest
+func TestCreateAppWithNoNameSpaceWhenRequired(t *testing.T) {
+	Given(t).
+		Path(guestbookPath).
+		When().
+		CreateWithNoNameSpace().
+		Then().
+		And(func(app *Application) {
+			var updatedApp *Application
+			for i := 0; i < 3; i++ {
+				obj, err := AppClientset.ArgoprojV1alpha1().Applications(ArgoCDNamespace).Get(app.Name, metav1.GetOptions{})
+				assert.NoError(t, err)
+				updatedApp = obj
+				if len(updatedApp.Status.Conditions) > 0 {
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+			assert.Len(t, updatedApp.Status.Conditions, 2)
+			assert.Equal(t, updatedApp.Status.Conditions[0].Type, ApplicationConditionInvalidSpecError)
+			assert.Equal(t, updatedApp.Status.Conditions[1].Type, ApplicationConditionInvalidSpecError)
+		})
+}
+
+//Given: argocd app create does not provide --dest-namespace
+//       Manifest contains resource deployment, and service which requires namespace
+//       Some deployment and service has namespace in manifest
+//       Some deployment and service does not have namespace in manifest
+//Expect: app.Status.Conditions for deployment and service which does not have namespace in manifest
+func TestCreateAppWithNoNameSpaceWhenRequired2(t *testing.T) {
+	Given(t).
+		Path(guestbookWithNamespace).
+		When().
+		CreateWithNoNameSpace().
+		Then().
+		And(func(app *Application) {
+			var updatedApp *Application
+			for i := 0; i < 3; i++ {
+				obj, err := AppClientset.ArgoprojV1alpha1().Applications(ArgoCDNamespace).Get(app.Name, metav1.GetOptions{})
+				assert.NoError(t, err)
+				updatedApp = obj
+				if len(updatedApp.Status.Conditions) > 0 {
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+			assert.Len(t, updatedApp.Status.Conditions, 2)
+			assert.Equal(t, updatedApp.Status.Conditions[0].Type, ApplicationConditionInvalidSpecError)
+			assert.Equal(t, updatedApp.Status.Conditions[1].Type, ApplicationConditionInvalidSpecError)
+		})
+}
+
+func TestListResource(t *testing.T) {
+	Given(t).
+		ProjectSpec(AppProjectSpec{
+			SourceRepos:       []string{"*"},
+			Destinations:      []ApplicationDestination{{Namespace: "*", Server: "*"}},
+			OrphanedResources: &OrphanedResourcesMonitorSettings{Warn: pointer.BoolPtr(true)},
+		}).
+		Path(guestbookPath).
+		When().
+		Create().
+		Sync().
+		Then().
+		Expect(SyncStatusIs(SyncStatusCodeSynced)).
+		Expect(NoConditions()).
+		When().
+		And(func() {
+			FailOnErr(KubeClientset.CoreV1().ConfigMaps(DeploymentNamespace()).Create(&v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "orphaned-configmap",
+				},
+			}))
+		}).
+		Refresh(RefreshTypeNormal).
+		Then().
+		Expect(Condition(ApplicationConditionOrphanedResourceWarning, "Application has 1 orphaned resources")).
+		And(func(app *Application) {
+			output, err := RunCli("app", "resources", app.Name)
+			assert.NoError(t, err)
+			assert.Contains(t, output, "orphaned-configmap")
+			assert.Contains(t, output, "guestbook-ui")
+		}).
+		And(func(app *Application) {
+			output, err := RunCli("app", "resources", app.Name, "--orphaned=true")
+			assert.NoError(t, err)
+			assert.Contains(t, output, "orphaned-configmap")
+			assert.NotContains(t, output, "guestbook-ui")
+		}).
+		And(func(app *Application) {
+			output, err := RunCli("app", "resources", app.Name, "--orphaned=false")
+			assert.NoError(t, err)
+			assert.NotContains(t, output, "orphaned-configmap")
+			assert.Contains(t, output, "guestbook-ui")
+		}).
+		Given().
+		ProjectSpec(AppProjectSpec{
+			SourceRepos:       []string{"*"},
+			Destinations:      []ApplicationDestination{{Namespace: "*", Server: "*"}},
+			OrphanedResources: nil,
+		}).
+		When().
+		Refresh(RefreshTypeNormal).
+		Then().
+		Expect(SyncStatusIs(SyncStatusCodeSynced)).
+		Expect(NoConditions())
 }

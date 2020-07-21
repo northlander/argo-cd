@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/argoproj/gitops-engine/pkg/utils/io"
 	"github.com/argoproj/gitops-engine/pkg/utils/kube/kubetest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -110,7 +109,7 @@ func TestContainsSyncResource(t *testing.T) {
 	}
 
 	for _, table := range tables {
-		if out := ContainsSyncResource(table.u.GetName(), table.u.GroupVersionKind(), table.rr); out != table.expected {
+		if out := ContainsSyncResource(table.u.GetName(), table.u.GetNamespace(), table.u.GroupVersionKind(), table.rr); out != table.expected {
 			t.Errorf("Expected %t for slice %+v contains resource %+v; instead got %t", table.expected, table.rr, table.u, out)
 		}
 	}
@@ -161,7 +160,7 @@ func TestValidatePermissionsEmptyDestination(t *testing.T) {
 		},
 	}, nil)
 	assert.NoError(t, err)
-	assert.ElementsMatch(t, conditions, []argoappv1.ApplicationCondition{{Type: argoappv1.ApplicationConditionInvalidSpecError, Message: "Destination server and/or namespace missing from app spec"}})
+	assert.ElementsMatch(t, conditions, []argoappv1.ApplicationCondition{{Type: argoappv1.ApplicationConditionInvalidSpecError, Message: "Destination server missing from app spec"}})
 }
 
 func TestValidateChartWithoutRevision(t *testing.T) {
@@ -260,8 +259,7 @@ func TestValidateRepo(t *testing.T) {
 		KustomizeOptions: kustomizeOptions,
 	}).Return(&apiclient.RepoAppDetailsResponse{}, nil)
 
-	repoClientSet := &mocks.Clientset{}
-	repoClientSet.On("NewRepoServerClient").Return(io.NopCloser, repoClient, nil)
+	repoClientSet := &mocks.Clientset{RepoServerServiceClient: repoClient}
 
 	db := &dbmocks.ArgoDB{}
 
@@ -579,6 +577,110 @@ func TestSetAppOperations(t *testing.T) {
 		app, err := SetAppOperation(appIf, "someapp", &argoappv1.Operation{Sync: &argoappv1.SyncOperation{Revision: "aaa"}})
 		assert.NoError(t, err)
 		assert.NotNil(t, app)
+	})
+
+}
+
+func TestValidateDestination(t *testing.T) {
+	t.Run("Validate destination with server url", func(t *testing.T) {
+		dest := argoappv1.ApplicationDestination{
+			Server:    "https://127.0.0.1:6443",
+			Namespace: "default",
+		}
+
+		appCond := ValidateDestination(context.Background(), &dest, nil)
+		assert.Nil(t, appCond)
+		assert.False(t, dest.IsServerInferred())
+	})
+
+	t.Run("Validate destination with server name", func(t *testing.T) {
+		dest := argoappv1.ApplicationDestination{
+			Name: "minikube",
+		}
+
+		db := &dbmocks.ArgoDB{}
+		db.On("ListClusters", context.Background()).Return(&argoappv1.ClusterList{
+			Items: []argoappv1.Cluster{
+				{
+					Name:   "minikube",
+					Server: "https://127.0.0.1:6443",
+				},
+			},
+		}, nil)
+
+		appCond := ValidateDestination(context.Background(), &dest, db)
+		assert.Nil(t, appCond)
+		assert.Equal(t, "https://127.0.0.1:6443", dest.Server)
+		assert.True(t, dest.IsServerInferred())
+	})
+
+	t.Run("Error when having both server url and name", func(t *testing.T) {
+		dest := argoappv1.ApplicationDestination{
+			Server:    "https://127.0.0.1:6443",
+			Name:      "minikube",
+			Namespace: "default",
+		}
+
+		err := ValidateDestination(context.Background(), &dest, nil)
+		assert.Equal(t, "application destination can't have both name and server defined: minikube https://127.0.0.1:6443", err.Error())
+		assert.False(t, dest.IsServerInferred())
+	})
+
+	t.Run("List clusters fails", func(t *testing.T) {
+		dest := argoappv1.ApplicationDestination{
+			Name: "minikube",
+		}
+
+		db := &dbmocks.ArgoDB{}
+		db.On("ListClusters", context.Background()).Return(nil, fmt.Errorf("an error occured"))
+
+		err := ValidateDestination(context.Background(), &dest, db)
+		assert.Equal(t, "unable to find destination server: an error occured", err.Error())
+		assert.False(t, dest.IsServerInferred())
+	})
+
+	t.Run("Destination cluster does not exist", func(t *testing.T) {
+		dest := argoappv1.ApplicationDestination{
+			Name: "minikube",
+		}
+
+		db := &dbmocks.ArgoDB{}
+		db.On("ListClusters", context.Background()).Return(&argoappv1.ClusterList{
+			Items: []argoappv1.Cluster{
+				{
+					Name:   "dind",
+					Server: "https://127.0.0.1:6443",
+				},
+			},
+		}, nil)
+
+		err := ValidateDestination(context.Background(), &dest, db)
+		assert.Equal(t, "unable to find destination server: there are no clusters with this name: minikube", err.Error())
+		assert.False(t, dest.IsServerInferred())
+	})
+
+	t.Run("Validate too many clusters with the same name", func(t *testing.T) {
+		dest := argoappv1.ApplicationDestination{
+			Name: "dind",
+		}
+
+		db := &dbmocks.ArgoDB{}
+		db.On("ListClusters", context.Background()).Return(&argoappv1.ClusterList{
+			Items: []argoappv1.Cluster{
+				{
+					Name:   "dind",
+					Server: "https://127.0.0.1:2443",
+				},
+				{
+					Name:   "dind",
+					Server: "https://127.0.0.1:8443",
+				},
+			},
+		}, nil)
+
+		err := ValidateDestination(context.Background(), &dest, db)
+		assert.Equal(t, "unable to find destination server: there are 2 clusters with the same name: [https://127.0.0.1:2443 https://127.0.0.1:8443]", err.Error())
+		assert.False(t, dest.IsServerInferred())
 	})
 
 }

@@ -18,6 +18,7 @@ import (
 
 	"github.com/argoproj/argo-cd/controller/metrics"
 	appv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
+	"github.com/argoproj/argo-cd/util/argo"
 	"github.com/argoproj/argo-cd/util/db"
 	"github.com/argoproj/argo-cd/util/lua"
 	"github.com/argoproj/argo-cd/util/settings"
@@ -40,6 +41,8 @@ type LiveStateCache interface {
 	Run(ctx context.Context) error
 	// Returns information about monitored clusters
 	GetClustersInfo() []clustercache.ClusterInfo
+	// Init must be executed before cache can be used
+	Init() error
 }
 
 type ObjectUpdatedHandler = func(managedByApp map[string]bool, ref v1.ObjectReference)
@@ -72,33 +75,42 @@ func NewLiveStateCache(
 	}
 }
 
-type liveStateCache struct {
-	db                  db.ArgoDB
-	clusters            map[string]clustercache.ClusterCache
-	lock                sync.RWMutex
-	appInformer         cache.SharedIndexInformer
-	onObjectUpdated     ObjectUpdatedHandler
-	kubectl             kube.Kubectl
-	settingsMgr         *settings.SettingsManager
-	metricsServer       *metrics.MetricsServer
-	cacheSettings       clustercache.Settings
+type cacheSettings struct {
+	clusterSettings     clustercache.Settings
 	appInstanceLabelKey string
 }
 
-func (c *liveStateCache) loadCacheSettings() (*clustercache.Settings, string, error) {
+type liveStateCache struct {
+	db              db.ArgoDB
+	appInformer     cache.SharedIndexInformer
+	onObjectUpdated ObjectUpdatedHandler
+	kubectl         kube.Kubectl
+	settingsMgr     *settings.SettingsManager
+	metricsServer   *metrics.MetricsServer
+
+	clusters      map[string]clustercache.ClusterCache
+	cacheSettings cacheSettings
+	lock          sync.RWMutex
+}
+
+func (c *liveStateCache) loadCacheSettings() (*cacheSettings, error) {
 	appInstanceLabelKey, err := c.settingsMgr.GetAppInstanceLabelKey()
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	resourcesFilter, err := c.settingsMgr.GetResourcesFilter()
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	resourceOverrides, err := c.settingsMgr.GetResourceOverrides()
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	return &clustercache.Settings{ResourceHealthOverride: lua.ResourceHealthOverrides(resourceOverrides), ResourcesFilter: resourcesFilter}, appInstanceLabelKey, nil
+	clusterSettings := clustercache.Settings{
+		ResourceHealthOverride: lua.ResourceHealthOverrides(resourceOverrides),
+		ResourcesFilter:        resourcesFilter,
+	}
+	return &cacheSettings{clusterSettings, appInstanceLabelKey}, nil
 }
 
 func asResourceNode(r *clustercache.Resource) appv1.ResourceNode {
@@ -132,6 +144,7 @@ func asResourceNode(r *clustercache.Resource) appv1.ResourceNode {
 		NetworkingInfo:  resourceInfo.NetworkingInfo,
 		Images:          resourceInfo.Images,
 		Health:          resHealth,
+		CreatedAt:       r.CreationTimestamp,
 	}
 }
 
@@ -197,6 +210,7 @@ func skipAppRequeuing(key kube.ResourceKey) bool {
 func (c *liveStateCache) getCluster(server string) (clustercache.ClusterCache, error) {
 	c.lock.RLock()
 	clusterCache, ok := c.clusters[server]
+	cacheSettings := c.cacheSettings
 	c.lock.RUnlock()
 
 	if ok {
@@ -217,13 +231,13 @@ func (c *liveStateCache) getCluster(server string) (clustercache.ClusterCache, e
 	}
 
 	clusterCache = clustercache.NewClusterCache(cluster.RESTConfig(),
-		clustercache.SetSettings(c.cacheSettings),
+		clustercache.SetSettings(cacheSettings.clusterSettings),
 		clustercache.SetNamespaces(cluster.Namespaces),
 		clustercache.SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (interface{}, bool) {
 			res := &ResourceInfo{}
 			populateNodeInfo(un, res)
-			res.Health, _ = health.GetResourceHealth(un, c.cacheSettings.ResourceHealthOverride)
-			appName := kube.GetAppInstanceLabel(un, c.appInstanceLabelKey)
+			res.Health, _ = health.GetResourceHealth(un, cacheSettings.clusterSettings.ResourceHealthOverride)
+			appName := kube.GetAppInstanceLabel(un, cacheSettings.appInstanceLabelKey)
 			if isRoot && appName != "" {
 				res.AppName = appName
 			}
@@ -277,14 +291,14 @@ func (c *liveStateCache) getSyncedCluster(server string) (clustercache.ClusterCa
 	return clusterCache, nil
 }
 
-func (c *liveStateCache) invalidate(settings clustercache.Settings, appInstanceLabelKey string) {
+func (c *liveStateCache) invalidate(cacheSettings cacheSettings) {
 	log.Info("invalidating live state cache")
-	c.lock.RLock()
-	defer c.lock.RUnlock()
+	c.lock.Lock()
+	defer c.lock.Unlock()
 
-	c.appInstanceLabelKey = appInstanceLabelKey
+	c.cacheSettings = cacheSettings
 	for _, clust := range c.clusters {
-		clust.Invalidate(clustercache.SetSettings(settings))
+		clust.Invalidate(clustercache.SetSettings(cacheSettings.clusterSettings))
 	}
 	log.Info("live state cache invalidated")
 }
@@ -339,9 +353,17 @@ func (c *liveStateCache) GetVersionsInfo(serverURL string) (string, []metav1.API
 	return clusterInfo.GetServerVersion(), clusterInfo.GetAPIGroups(), nil
 }
 
-func isClusterHasApps(apps []interface{}, cluster *appv1.Cluster) bool {
+func (c *liveStateCache) isClusterHasApps(apps []interface{}, cluster *appv1.Cluster) bool {
 	for _, obj := range apps {
-		if app, ok := obj.(*appv1.Application); ok && app.Spec.Destination.Server == cluster.Server {
+		app, ok := obj.(*appv1.Application)
+		if !ok {
+			continue
+		}
+		err := argo.ValidateDestination(context.Background(), &app.Spec.Destination, c.db)
+		if err != nil {
+			continue
+		}
+		if app.Spec.Destination.Server == cluster.Server {
 			return true
 		}
 	}
@@ -356,7 +378,7 @@ func (c *liveStateCache) watchSettings(ctx context.Context) {
 	for !done {
 		select {
 		case <-updateCh:
-			nextCacheSettings, appInstanceLabelKey, err := c.loadCacheSettings()
+			nextCacheSettings, err := c.loadCacheSettings()
 			if err != nil {
 				log.Warnf("Failed to read updated settings: %v", err)
 				continue
@@ -370,7 +392,7 @@ func (c *liveStateCache) watchSettings(ctx context.Context) {
 			}
 			c.lock.Unlock()
 			if needInvalidate {
-				c.invalidate(*nextCacheSettings, appInstanceLabelKey)
+				c.invalidate(*nextCacheSettings)
 			}
 		case <-ctx.Done():
 			done = true
@@ -381,15 +403,17 @@ func (c *liveStateCache) watchSettings(ctx context.Context) {
 	close(updateCh)
 }
 
-// Run watches for resource changes annotated with application label on all registered clusters and schedule corresponding app refresh.
-func (c *liveStateCache) Run(ctx context.Context) error {
-	cacheSettings, appInstanceLabelKey, err := c.loadCacheSettings()
+func (c *liveStateCache) Init() error {
+	cacheSettings, err := c.loadCacheSettings()
 	if err != nil {
 		return err
 	}
 	c.cacheSettings = *cacheSettings
-	c.appInstanceLabelKey = appInstanceLabelKey
+	return nil
+}
 
+// Run watches for resource changes annotated with application label on all registered clusters and schedule corresponding app refresh.
+func (c *liveStateCache) Run(ctx context.Context) error {
 	go c.watchSettings(ctx)
 
 	kube.RetryUntilSucceed(func() error {
@@ -397,7 +421,7 @@ func (c *liveStateCache) Run(ctx context.Context) error {
 	}, "watch clusters", ctx, clustercache.ClusterRetryTimeout)
 
 	<-ctx.Done()
-	c.invalidate(c.cacheSettings, c.appInstanceLabelKey)
+	c.invalidate(c.cacheSettings)
 	return nil
 }
 
@@ -406,7 +430,7 @@ func (c *liveStateCache) handleAddEvent(cluster *appv1.Cluster) {
 	_, ok := c.clusters[cluster.Server]
 	c.lock.Unlock()
 	if !ok {
-		if isClusterHasApps(c.appInformer.GetStore().List(), cluster) {
+		if c.isClusterHasApps(c.appInformer.GetStore().List(), cluster) {
 			go func() {
 				// warm up cache for cluster with apps
 				_, _ = c.getSyncedCluster(cluster.Server)
@@ -416,24 +440,36 @@ func (c *liveStateCache) handleAddEvent(cluster *appv1.Cluster) {
 }
 
 func (c *liveStateCache) handleModEvent(oldCluster *appv1.Cluster, newCluster *appv1.Cluster) {
-	var bToInvalidate bool
 	c.lock.Lock()
 	cluster, ok := c.clusters[newCluster.Server]
 	c.lock.Unlock()
 	if ok {
+		var shouldInvalidate bool
+
 		if oldCluster.Server != newCluster.Server {
-			bToInvalidate = true
+			shouldInvalidate = true
 		}
 		if !reflect.DeepEqual(oldCluster.Config, newCluster.Config) {
-			bToInvalidate = true
+			shouldInvalidate = true
 		}
 		if !reflect.DeepEqual(oldCluster.Namespaces, newCluster.Namespaces) {
-			bToInvalidate = true
+			shouldInvalidate = true
+		}
+		if newCluster.RefreshRequestedAt != nil &&
+			cluster.GetClusterInfo().LastCacheSyncTime != nil &&
+			cluster.GetClusterInfo().LastCacheSyncTime.Before(newCluster.RefreshRequestedAt.Time) {
+			shouldInvalidate = true
+		}
+
+		if shouldInvalidate {
+			cluster.Invalidate()
+			go func() {
+				// warm up cluster cache
+				_ = cluster.EnsureSynced()
+			}()
 		}
 	}
-	if bToInvalidate {
-		cluster.Invalidate()
-	}
+
 }
 
 func (c *liveStateCache) handleDeleteEvent(clusterServer string) {
@@ -447,11 +483,18 @@ func (c *liveStateCache) handleDeleteEvent(clusterServer string) {
 }
 
 func (c *liveStateCache) GetClustersInfo() []clustercache.ClusterInfo {
+	clusters := make(map[string]clustercache.ClusterCache)
 	c.lock.RLock()
-	defer c.lock.RUnlock()
+	for k := range c.clusters {
+		clusters[k] = c.clusters[k]
+	}
+	c.lock.RUnlock()
+
 	res := make([]clustercache.ClusterInfo, 0)
-	for _, info := range c.clusters {
-		res = append(res, info.GetClusterInfo())
+	for server, c := range clusters {
+		info := c.GetClusterInfo()
+		info.Server = server
+		res = append(res, info)
 	}
 	return res
 }

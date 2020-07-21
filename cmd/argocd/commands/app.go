@@ -92,6 +92,7 @@ func NewApplicationCommand(clientOpts *argocdclient.ClientOptions) *cobra.Comman
 	command.AddCommand(NewApplicationPatchCommand(clientOpts))
 	command.AddCommand(NewApplicationPatchResourceCommand(clientOpts))
 	command.AddCommand(NewApplicationResourceActionsCommand(clientOpts))
+	command.AddCommand(NewApplicationListResourcesCommand(clientOpts))
 	return command
 }
 
@@ -201,6 +202,18 @@ func setLabels(app *argoappv1.Application, labels []string) {
 	mapLabels, err := label.Parse(labels)
 	errors.CheckError(err)
 	app.SetLabels(mapLabels)
+}
+
+func getInfos(infos []string) []*argoappv1.Info {
+	mapInfos, err := label.Parse(infos)
+	errors.CheckError(err)
+	sliceInfos := make([]*argoappv1.Info, len(mapInfos))
+	i := 0
+	for key, element := range mapInfos {
+		sliceInfos[i] = &argoappv1.Info{Name: key, Value: element}
+		i++
+	}
+	return sliceInfos
 }
 
 func getRefreshType(refresh bool, hardRefresh bool) *string {
@@ -517,6 +530,8 @@ func setAppSpecOptions(flags *pflag.FlagSet, spec *argoappv1.ApplicationSpec, ap
 			spec.Source.Directory = &argoappv1.ApplicationSourceDirectory{Recurse: appOpts.directoryRecurse}
 		case "config-management-plugin":
 			spec.Source.Plugin = &argoappv1.ApplicationSourcePlugin{Name: appOpts.configManagementPlugin}
+		case "dest-name":
+			spec.Destination.Name = appOpts.destName
 		case "dest-server":
 			spec.Destination.Server = appOpts.destServer
 		case "dest-namespace":
@@ -539,13 +554,10 @@ func setAppSpecOptions(flags *pflag.FlagSet, spec *argoappv1.ApplicationSpec, ap
 			setJsonnetOptExtVar(&spec.Source, appOpts.jsonnetExtVarStr, false)
 		case "jsonnet-ext-var-code":
 			setJsonnetOptExtVar(&spec.Source, appOpts.jsonnetExtVarCode, true)
+		case "jsonnet-libs":
+			setJsonnetOptLibs(&spec.Source, appOpts.jsonnetLibs)
 		case "sync-policy":
 			switch appOpts.syncPolicy {
-			case "automated":
-				if spec.SyncPolicy == nil {
-					spec.SyncPolicy = &argoappv1.SyncPolicy{}
-				}
-				spec.SyncPolicy.Automated = &argoappv1.SyncPolicyAutomated{}
 			case "none":
 				if spec.SyncPolicy != nil {
 					spec.SyncPolicy.Automated = nil
@@ -553,6 +565,11 @@ func setAppSpecOptions(flags *pflag.FlagSet, spec *argoappv1.ApplicationSpec, ap
 				if spec.SyncPolicy.IsZero() {
 					spec.SyncPolicy = nil
 				}
+			case "automated", "automatic", "auto":
+				if spec.SyncPolicy == nil {
+					spec.SyncPolicy = &argoappv1.SyncPolicy{}
+				}
+				spec.SyncPolicy.Automated = &argoappv1.SyncPolicyAutomated{}
 			default:
 				log.Fatalf("Invalid sync-policy: %s", appOpts.syncPolicy)
 			}
@@ -689,6 +706,12 @@ func setJsonnetOptExtVar(src *argoappv1.ApplicationSource, jsonnetExtVar []strin
 		src.Directory.Jsonnet.ExtVars = append(src.Directory.Jsonnet.ExtVars, argoappv1.NewJsonnetVar(j, code))
 	}
 }
+func setJsonnetOptLibs(src *argoappv1.ApplicationSource, libs []string) {
+	if src.Directory == nil {
+		src.Directory = &argoappv1.ApplicationSourceDirectory{}
+	}
+	src.Directory.Jsonnet.Libs = append(src.Directory.Jsonnet.Libs, libs...)
+}
 
 type appOptions struct {
 	repoURL                string
@@ -697,6 +720,7 @@ type appOptions struct {
 	env                    string
 	revision               string
 	revisionHistoryLimit   int
+	destName               string
 	destServer             string
 	destNamespace          string
 	parameters             []string
@@ -719,6 +743,7 @@ type appOptions struct {
 	jsonnetTlaCode         []string
 	jsonnetExtVarStr       []string
 	jsonnetExtVarCode      []string
+	jsonnetLibs            []string
 	kustomizeImages        []string
 	kustomizeVersion       string
 }
@@ -731,6 +756,7 @@ func addAppFlags(command *cobra.Command, opts *appOptions) {
 	command.Flags().StringVar(&opts.revision, "revision", "", "The tracking source branch, tag, commit or Helm chart version the application will sync to")
 	command.Flags().IntVar(&opts.revisionHistoryLimit, "revision-history-limit", common.RevisionHistoryLimit, "How many items to keep in revision history")
 	command.Flags().StringVar(&opts.destServer, "dest-server", "", "K8s cluster URL (e.g. https://kubernetes.default.svc)")
+	command.Flags().StringVar(&opts.destName, "dest-name", "", "K8s cluster Name (e.g. minikube)")
 	command.Flags().StringVar(&opts.destNamespace, "dest-namespace", "", "K8s target namespace (overrides the namespace specified in the ksonnet app.yaml)")
 	command.Flags().StringArrayVarP(&opts.parameters, "parameter", "p", []string{}, "set a parameter override (e.g. -p guestbook=image=example/guestbook:latest)")
 	command.Flags().StringArrayVar(&opts.valuesFiles, "values", []string{}, "Helm values file(s) to use")
@@ -740,7 +766,7 @@ func addAppFlags(command *cobra.Command, opts *appOptions) {
 	command.Flags().StringArrayVar(&opts.helmSetStrings, "helm-set-string", []string{}, "Helm set STRING values on the command line (can be repeated to set several values: --helm-set-string key1=val1 --helm-set-string key2=val2)")
 	command.Flags().StringArrayVar(&opts.helmSetFiles, "helm-set-file", []string{}, "Helm set values from respective files specified via the command line (can be repeated to set several values: --helm-set-file key1=path1 --helm-set-file key2=path2)")
 	command.Flags().StringVar(&opts.project, "project", "", "Application project name")
-	command.Flags().StringVar(&opts.syncPolicy, "sync-policy", "", "Set the sync policy (one of: automated, none)")
+	command.Flags().StringVar(&opts.syncPolicy, "sync-policy", "", "Set the sync policy (one of: none, automated (aliases of automated: auto, automatic))")
 	command.Flags().StringArrayVar(&opts.syncOptions, "sync-option", []string{}, "Add or remove a sync options, e.g add `Prune=false`. Remove using `!` prefix, e.g. `!Prune=false`")
 	command.Flags().BoolVar(&opts.autoPrune, "auto-prune", false, "Set automatic pruning when sync is automated")
 	command.Flags().BoolVar(&opts.selfHeal, "self-heal", false, "Set self healing when sync is automated")
@@ -753,6 +779,7 @@ func addAppFlags(command *cobra.Command, opts *appOptions) {
 	command.Flags().StringArrayVar(&opts.jsonnetTlaCode, "jsonnet-tla-code", []string{}, "Jsonnet top level code arguments")
 	command.Flags().StringArrayVar(&opts.jsonnetExtVarStr, "jsonnet-ext-var-str", []string{}, "Jsonnet string ext var")
 	command.Flags().StringArrayVar(&opts.jsonnetExtVarCode, "jsonnet-ext-var-code", []string{}, "Jsonnet ext var")
+	command.Flags().StringArrayVar(&opts.jsonnetLibs, "jsonnet-libs", []string{}, "Additional jsonnet libs (prefixed by repoRoot)")
 	command.Flags().StringArrayVar(&opts.kustomizeImages, "kustomize-image", []string{}, "Kustomize images (e.g. --kustomize-image node:8.15.0 --kustomize-image mysql=mariadb,alpine@sha256:24a0c4b4a4c0eb97a1aabb8e29f18e917d05abfe1b7a7c07857230879ce7d3d)")
 }
 
@@ -918,9 +945,9 @@ func liveObjects(resources []*argoappv1.ResourceDiff) ([]*unstructured.Unstructu
 	return objs, nil
 }
 
-func getLocalObjects(app *argoappv1.Application, local, appLabelKey, kubeVersion string, kustomizeOptions *argoappv1.KustomizeOptions,
+func getLocalObjects(app *argoappv1.Application, local, localRepoRoot, appLabelKey, kubeVersion string, kustomizeOptions *argoappv1.KustomizeOptions,
 	configManagementPlugins []*argoappv1.ConfigManagementPlugin) []*unstructured.Unstructured {
-	manifestStrings := getLocalObjectsString(app, local, appLabelKey, kubeVersion, kustomizeOptions, configManagementPlugins)
+	manifestStrings := getLocalObjectsString(app, local, localRepoRoot, appLabelKey, kubeVersion, kustomizeOptions, configManagementPlugins)
 	objs := make([]*unstructured.Unstructured, len(manifestStrings))
 	for i := range manifestStrings {
 		obj := unstructured.Unstructured{}
@@ -931,9 +958,10 @@ func getLocalObjects(app *argoappv1.Application, local, appLabelKey, kubeVersion
 	return objs
 }
 
-func getLocalObjectsString(app *argoappv1.Application, local, appLabelKey, kubeVersion string, kustomizeOptions *argoappv1.KustomizeOptions,
+func getLocalObjectsString(app *argoappv1.Application, local, localRepoRoot, appLabelKey, kubeVersion string, kustomizeOptions *argoappv1.KustomizeOptions,
 	configManagementPlugins []*argoappv1.ConfigManagementPlugin) []string {
-	res, err := repository.GenerateManifests(local, "/", app.Spec.Source.TargetRevision, &repoapiclient.ManifestRequest{
+
+	res, err := repository.GenerateManifests(local, localRepoRoot, app.Spec.Source.TargetRevision, &repoapiclient.ManifestRequest{
 		Repo:              &argoappv1.Repository{Repo: app.Spec.Source.RepoURL},
 		AppLabelKey:       appLabelKey,
 		AppLabelValue:     app.Name,
@@ -981,9 +1009,10 @@ func groupLocalObjs(localObs []*unstructured.Unstructured, liveObjs []*unstructu
 // NewApplicationDiffCommand returns a new instance of an `argocd app diff` command
 func NewApplicationDiffCommand(clientOpts *argocdclient.ClientOptions) *cobra.Command {
 	var (
-		refresh     bool
-		hardRefresh bool
-		local       string
+		refresh       bool
+		hardRefresh   bool
+		local         string
+		localRepoRoot string
 	)
 	shortDesc := "Perform a diff against the target and live state."
 	var command = &cobra.Command{
@@ -1022,7 +1051,7 @@ func NewApplicationDiffCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 				defer argoio.Close(conn)
 				cluster, err := clusterIf.Get(context.Background(), &clusterpkg.ClusterQuery{Server: app.Spec.Destination.Server})
 				errors.CheckError(err)
-				localObjs := groupLocalObjs(getLocalObjects(app, local, argoSettings.AppLabelKey, cluster.ServerVersion, argoSettings.KustomizeOptions, argoSettings.ConfigManagementPlugins), liveObjs, app.Spec.Destination.Namespace)
+				localObjs := groupLocalObjs(getLocalObjects(app, local, localRepoRoot, argoSettings.AppLabelKey, cluster.ServerVersion, argoSettings.KustomizeOptions, argoSettings.ConfigManagementPlugins), liveObjs, app.Spec.Destination.Namespace)
 				for _, res := range resources.Items {
 					var live = &unstructured.Unstructured{}
 					err := json.Unmarshal([]byte(res.NormalizedLiveState), &live)
@@ -1129,6 +1158,7 @@ func NewApplicationDiffCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 	command.Flags().BoolVar(&refresh, "refresh", false, "Refresh application data when retrieving")
 	command.Flags().BoolVar(&hardRefresh, "hard-refresh", false, "Refresh application data as well as target manifests cache")
 	command.Flags().StringVar(&local, "local", "", "Compare live app to a local manifests")
+	command.Flags().StringVar(&localRepoRoot, "local-repo-root", "/", "Path to the repository root. Used together with --local allows setting the repository root")
 	return command
 }
 
@@ -1281,8 +1311,10 @@ func formatConditionsSummary(app argoappv1.Application) string {
 }
 
 const (
-	resourceFieldDelimiter = ":"
-	resourceFieldCount     = 3
+	resourceFieldDelimiter              = ":"
+	resourceFieldCount                  = 3
+	resourceFieldNamespaceDelimiter     = "/"
+	resourceFieldNameWithNamespaceCount = 2
 )
 
 func parseSelectedResources(resources []string) []argoappv1.SyncOperationResource {
@@ -1294,10 +1326,21 @@ func parseSelectedResources(resources []string) []argoappv1.SyncOperationResourc
 			if len(fields) != resourceFieldCount {
 				log.Fatalf("Resource should have GROUP%sKIND%sNAME, but instead got: %s", resourceFieldDelimiter, resourceFieldDelimiter, r)
 			}
+			name := fields[2]
+			namespace := ""
+			if strings.Contains(fields[2], resourceFieldNamespaceDelimiter) {
+				nameFields := strings.Split(fields[2], resourceFieldNamespaceDelimiter)
+				if len(nameFields) != resourceFieldNameWithNamespaceCount {
+					log.Fatalf("Resource with namespace should have GROUP%sKIND%sNAMESPACE%sNAME, but instead got: %s", resourceFieldDelimiter, resourceFieldDelimiter, resourceFieldNamespaceDelimiter, r)
+				}
+				namespace = nameFields[0]
+				name = nameFields[1]
+			}
 			rsrc := argoappv1.SyncOperationResource{
-				Group: fields[0],
-				Kind:  fields[1],
-				Name:  fields[2],
+				Group:     fields[0],
+				Kind:      fields[1],
+				Name:      name,
+				Namespace: namespace,
 			}
 			selectedResources = append(selectedResources, rsrc)
 		}
@@ -1351,7 +1394,7 @@ func NewApplicationWaitCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 				}
 			}
 			for _, appName := range appNames {
-				_, err := waitOnApplicationStatus(acdClient, appName, timeout, watchSync, watchHealth, watchOperations, watchSuspended, selectedResources)
+				_, err := waitOnApplicationStatus(acdClient, appName, timeout, watchSync, watchHealth, watchOperations, watchSuspended, selectedResources, false)
 				errors.CheckError(err)
 			}
 		},
@@ -1377,17 +1420,19 @@ func printAppResources(w io.Writer, app *argoappv1.Application) {
 // NewApplicationSyncCommand returns a new instance of an `argocd app sync` command
 func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Command {
 	var (
-		revision  string
-		resources []string
-		labels    []string
-		selector  string
-		prune     bool
-		dryRun    bool
-		timeout   uint
-		strategy  string
-		force     bool
-		async     bool
-		local     string
+		revision      string
+		resources     []string
+		labels        []string
+		selector      string
+		prune         bool
+		dryRun        bool
+		timeout       uint
+		strategy      string
+		force         bool
+		async         bool
+		local         string
+		localRepoRoot string
+		infos         []string
 	)
 	var command = &cobra.Command{
 		Use:   "sync [APPNAME... | -l selector]",
@@ -1470,8 +1515,8 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 				if local != "" {
 					app, err := appIf.Get(context.Background(), &applicationpkg.ApplicationQuery{Name: &appName})
 					errors.CheckError(err)
-					if app.Spec.SyncPolicy != nil && app.Spec.SyncPolicy.Automated != nil {
-						log.Fatal("Cannot use local sync when Automatic Sync Policy is enabled")
+					if app.Spec.SyncPolicy != nil && app.Spec.SyncPolicy.Automated != nil && !dryRun {
+						log.Fatal("Cannot use local sync when Automatic Sync Policy is enabled except with --dry-run")
 					}
 
 					errors.CheckError(err)
@@ -1485,7 +1530,7 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 					cluster, err := clusterIf.Get(context.Background(), &clusterpkg.ClusterQuery{Server: app.Spec.Destination.Server})
 					errors.CheckError(err)
 					argoio.Close(conn)
-					localObjsStrings = getLocalObjectsString(app, local, argoSettings.AppLabelKey, cluster.ServerVersion, argoSettings.KustomizeOptions, argoSettings.ConfigManagementPlugins)
+					localObjsStrings = getLocalObjectsString(app, local, localRepoRoot, argoSettings.AppLabelKey, cluster.ServerVersion, argoSettings.KustomizeOptions, argoSettings.ConfigManagementPlugins)
 				}
 
 				syncReq := applicationpkg.ApplicationSyncRequest{
@@ -1495,6 +1540,7 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 					Resources: selectedResources,
 					Prune:     prune,
 					Manifests: localObjsStrings,
+					Infos:     getInfos(infos),
 				}
 				switch strategy {
 				case "apply":
@@ -1511,7 +1557,7 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 				errors.CheckError(err)
 
 				if !async {
-					app, err := waitOnApplicationStatus(acdClient, appName, timeout, false, false, true, false, selectedResources)
+					app, err := waitOnApplicationStatus(acdClient, appName, timeout, false, false, true, false, selectedResources, dryRun)
 					errors.CheckError(err)
 
 					if !dryRun {
@@ -1540,6 +1586,8 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 	command.Flags().BoolVar(&force, "force", false, "Use a force apply")
 	command.Flags().BoolVar(&async, "async", false, "Do not wait for application to sync before continuing")
 	command.Flags().StringVar(&local, "local", "", "Path to a local directory. When this flag is present no git queries will be made")
+	command.Flags().StringVar(&localRepoRoot, "local-repo-root", "/", "Path to the repository root. Used together with --local allows setting the repository root")
+	command.Flags().StringArrayVar(&infos, "info", []string{}, "A list of key-value pairs during sync process. These infos will be persisted in app.")
 	return command
 }
 
@@ -1630,7 +1678,7 @@ func getResourceStates(app *argoappv1.Application, selectedResources []argoappv1
 	if len(selectedResources) > 0 {
 		for i := len(states) - 1; i >= 0; i-- {
 			res := states[i]
-			if !argo.ContainsSyncResource(res.Name, schema.GroupVersionKind{Group: res.Group, Kind: res.Kind}, selectedResources) {
+			if !argo.ContainsSyncResource(res.Name, res.Namespace, schema.GroupVersionKind{Group: res.Group, Kind: res.Kind}, selectedResources) {
 				states = append(states[:i], states[i+1:]...)
 			}
 		}
@@ -1669,7 +1717,7 @@ func checkResourceStatus(watchSync bool, watchHealth bool, watchOperation bool, 
 
 const waitFormatString = "%s\t%5s\t%10s\t%10s\t%20s\t%8s\t%7s\t%10s\t%s\n"
 
-func waitOnApplicationStatus(acdClient apiclient.Client, appName string, timeout uint, watchSync bool, watchHealth bool, watchOperation bool, watchSuspended bool, selectedResources []argoappv1.SyncOperationResource) (*argoappv1.Application, error) {
+func waitOnApplicationStatus(acdClient apiclient.Client, appName string, timeout uint, watchSync bool, watchHealth bool, watchOperation bool, watchSuspended bool, selectedResources []argoappv1.SyncOperationResource, dryRun bool) (*argoappv1.Application, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1714,11 +1762,11 @@ func waitOnApplicationStatus(acdClient apiclient.Client, appName string, timeout
 	_, _ = fmt.Fprintf(w, waitFormatString, "TIMESTAMP", "GROUP", "KIND", "NAMESPACE", "NAME", "STATUS", "HEALTH", "HOOK", "MESSAGE")
 
 	prevStates := make(map[string]*resourceState)
-	appEventCh := acdClient.WatchApplicationWithRetry(ctx, appName)
 	conn, appClient := acdClient.NewApplicationClientOrDie()
 	defer argoio.Close(conn)
 	app, err := appClient.Get(ctx, &applicationpkg.ApplicationQuery{Name: &appName})
 	errors.CheckError(err)
+	appEventCh := acdClient.WatchApplicationWithRetry(ctx, appName, app.ResourceVersion)
 
 	for appEvent := range appEventCh {
 		app = &appEvent.Application
@@ -1728,7 +1776,9 @@ func waitOnApplicationStatus(acdClient apiclient.Client, appName string, timeout
 		if app.Operation != nil {
 			// if it just got requested
 			operationInProgress = true
-			refresh = true
+			if !dryRun {
+				refresh = true
+			}
 		} else if app.Status.OperationState != nil {
 			if app.Status.OperationState.FinishedAt == nil {
 				// if it is not finished yet
@@ -1946,7 +1996,7 @@ func NewApplicationRollbackCommand(clientOpts *argocdclient.ClientOptions) *cobr
 			})
 			errors.CheckError(err)
 
-			_, err = waitOnApplicationStatus(acdClient, appName, timeout, false, false, true, false, nil)
+			_, err = waitOnApplicationStatus(acdClient, appName, timeout, false, false, true, false, nil, false)
 			errors.CheckError(err)
 		},
 	}
@@ -2102,6 +2152,45 @@ func NewApplicationEditCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 			})
 		},
 	}
+	return command
+}
+
+func NewApplicationListResourcesCommand(clientOpts *argocdclient.ClientOptions) *cobra.Command {
+	var orphaned bool
+	var command = &cobra.Command{
+		Use:   "resources APPNAME",
+		Short: "List resource of application",
+		Run: func(c *cobra.Command, args []string) {
+			if len(args) != 1 {
+				c.HelpFunc()(c, args)
+				os.Exit(1)
+			}
+			listAll := !c.Flag("orphaned").Changed
+			appName := args[0]
+			conn, appIf := argocdclient.NewClientOrDie(clientOpts).NewApplicationClientOrDie()
+			defer argoio.Close(conn)
+			appResourceTree, err := appIf.ResourceTree(context.Background(), &applicationpkg.ResourcesQuery{ApplicationName: &appName})
+			errors.CheckError(err)
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			headers := []interface{}{"GROUP", "KIND", "NAMESPACE", "NAME", "ORPHANED"}
+			fmtStr := "%s\t%s\t%s\t%s\t%s\n"
+			_, _ = fmt.Fprintf(w, fmtStr, headers...)
+			if !orphaned || listAll {
+				for _, res := range appResourceTree.Nodes {
+					if len(res.ParentRefs) == 0 {
+						_, _ = fmt.Fprintf(w, fmtStr, res.Group, res.Kind, res.Namespace, res.Name, "No")
+					}
+				}
+			}
+			if orphaned || listAll {
+				for _, res := range appResourceTree.OrphanedNodes {
+					_, _ = fmt.Fprintf(w, fmtStr, res.Group, res.Kind, res.Namespace, res.Name, "Yes")
+				}
+			}
+			_ = w.Flush()
+		},
+	}
+	command.Flags().BoolVar(&orphaned, "orphaned", false, "Lists only orphaned resources")
 	return command
 }
 

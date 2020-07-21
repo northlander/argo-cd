@@ -76,6 +76,7 @@ func NewCommand() *cobra.Command {
 	command.AddCommand(NewClusterConfig())
 	command.AddCommand(commands.NewProjectsCommand())
 	command.AddCommand(commands.NewSettingsCommand())
+	command.AddCommand(commands.NewAppsCommand())
 
 	command.Flags().StringVar(&logFormat, "logformat", "text", "Set the logging format. One of: text|json")
 	command.Flags().StringVar(&logLevel, "loglevel", "info", "Set the logging level. One of: debug|info|warn|error")
@@ -280,7 +281,7 @@ func NewImportCommand() *cobra.Command {
 			}
 
 			// Create or replace existing object
-			backupObjects, err := kube.SplitYAML(string(input))
+			backupObjects, err := kube.SplitYAML(input)
 			errors.CheckError(err)
 			for _, bakObj := range backupObjects {
 				gvk := bakObj.GroupVersionKind()

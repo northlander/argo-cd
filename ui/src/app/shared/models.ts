@@ -80,6 +80,7 @@ export interface RevisionMetadata {
     date: models.Time;
     tags?: string[];
     message?: string;
+    signatureInfo?: string;
 }
 
 export interface SyncOperationResult {
@@ -141,6 +142,12 @@ export interface ApplicationDestination {
      * Namespace overrides the environment namespace value in the ksonnet app.yaml
      */
     namespace: string;
+}
+
+export interface OrphanedResource {
+    group: string;
+    kind: string;
+    name: string;
 }
 
 export interface ApplicationSource {
@@ -244,6 +251,7 @@ export interface RevisionHistory {
     id: number;
     revision: string;
     source: ApplicationSource;
+    deployStartedAt: models.Time;
     deployedAt: models.Time;
 }
 
@@ -313,6 +321,7 @@ export interface ResourceNode extends ResourceRef {
     networkingInfo?: ResourceNetworkingInfo;
     images?: string[];
     resourceVersion: string;
+    createdAt?: models.Time;
 }
 
 export interface ApplicationTree {
@@ -361,6 +370,13 @@ export interface ApplicationStatus {
     health: HealthStatus;
     operationState?: OperationState;
     summary?: ApplicationSummary;
+}
+
+export interface JwtTokens {
+    items: JwtToken[];
+}
+export interface AppProjectStatus {
+    jwtTokensByRole: {[name: string]: JwtTokens};
 }
 
 export interface LogEntry {
@@ -448,8 +464,25 @@ export interface RepoCredsList extends ItemsList<RepoCreds> {}
 export interface Cluster {
     name: string;
     server: string;
-    connectionState: ConnectionState;
-    serverVersion: string;
+    namespaces?: [];
+    refreshRequestedAt?: models.Time;
+    config?: {
+        awsAuthConfig?: {
+            clusterName: string;
+        };
+    };
+    info?: {
+        applicationsCount: number;
+        serverVersion: string;
+        connectionState: ConnectionState;
+        cacheInfo: ClusterCacheInfo;
+    };
+}
+
+export interface ClusterCacheInfo {
+    resourcesCount: number;
+    apisCount: number;
+    lastCacheSyncTime: models.Time;
 }
 
 export interface ClusterList extends ItemsList<Cluster> {}
@@ -571,7 +604,6 @@ export interface ProjectRole {
     description: string;
     policies: string[];
     name: string;
-    jwtTokens: JwtToken[];
     groups: string[];
 }
 
@@ -586,6 +618,10 @@ export interface GroupKind {
     kind: string;
 }
 
+export interface ProjectSignatureKey {
+    keyID: string;
+}
+
 export interface ProjectSpec {
     sourceRepos: string[];
     destinations: ApplicationDestination[];
@@ -594,7 +630,8 @@ export interface ProjectSpec {
     clusterResourceWhitelist: GroupKind[];
     namespaceResourceBlacklist: GroupKind[];
     namespaceResourceWhitelist: GroupKind[];
-    orphanedResources?: {warn?: boolean};
+    signatureKeys: ProjectSignatureKey[];
+    orphanedResources?: {warn?: boolean; ignore: OrphanedResource[]};
     syncWindows?: SyncWindows;
 }
 
@@ -615,6 +652,7 @@ export interface Project {
     kind?: string;
     metadata: models.ObjectMeta;
     spec: ProjectSpec;
+    status: AppProjectStatus;
 }
 
 export type ProjectList = ItemsList<Project>;
@@ -667,3 +705,13 @@ export interface Account {
     capabilities: string[];
     tokens: Token[];
 }
+
+export interface GnuPGPublicKey {
+    keyID?: string;
+    fingerprint?: string;
+    subType?: string;
+    owner?: string;
+    keyData?: string;
+}
+
+export interface GnuPGPublicKeyList extends ItemsList<GnuPGPublicKey> {}

@@ -76,6 +76,9 @@ func (m *appStateManager) SyncAppState(app *v1alpha1.Application, state *v1alpha
 	}
 
 	compareResult := m.CompareAppState(app, proj, revision, source, false, syncOp.Manifests)
+	// We now have a concrete commit SHA. Save this in the sync result revision so that we remember
+	// what we should be syncing to when resuming operations.
+	syncRes.Revision = compareResult.syncStatus.Revision
 
 	// If there are any comparison or spec errors error conditions do not perform the operation
 	if errConditions := app.Status.GetConditions(map[v1alpha1.ApplicationConditionType]bool{
@@ -86,10 +89,6 @@ func (m *appStateManager) SyncAppState(app *v1alpha1.Application, state *v1alpha
 		state.Message = argo.FormatAppConditions(errConditions)
 		return
 	}
-
-	// We now have a concrete commit SHA. Save this in the sync result revision so that we remember
-	// what we should be syncing to when resuming operations.
-	syncRes.Revision = compareResult.syncStatus.Revision
 
 	clst, err := m.db.GetCluster(context.Background(), app.Spec.Destination.Server)
 	if err != nil {
@@ -140,7 +139,7 @@ func (m *appStateManager) SyncAppState(app *v1alpha1.Application, state *v1alpha
 		sync.WithOperationSettings(syncOp.DryRun, syncOp.Prune, syncOp.SyncStrategy.Force(), syncOp.IsApplyStrategy() || len(syncOp.Resources) > 0),
 		sync.WithInitialState(state.Phase, state.Message, initialResourcesRes),
 		sync.WithResourcesFilter(func(key kube.ResourceKey, target *unstructured.Unstructured, live *unstructured.Unstructured) bool {
-			return len(syncOp.Resources) == 0 || argo.ContainsSyncResource(key.Name, schema.GroupVersionKind{Kind: key.Kind, Group: key.Group}, syncOp.Resources)
+			return len(syncOp.Resources) == 0 || argo.ContainsSyncResource(key.Name, key.Namespace, schema.GroupVersionKind{Kind: key.Kind, Group: key.Group}, syncOp.Resources)
 		}),
 		sync.WithManifestValidation(!syncOp.SyncOptions.HasOption("Validate=false")),
 	)
@@ -178,7 +177,7 @@ func (m *appStateManager) SyncAppState(app *v1alpha1.Application, state *v1alpha
 	logEntry.WithField("duration", time.Since(start)).Info("sync/terminate complete")
 
 	if !syncOp.DryRun && len(syncOp.Resources) == 0 && state.Phase.Successful() {
-		err := m.persistRevisionHistory(app, compareResult.syncStatus.Revision, source)
+		err := m.persistRevisionHistory(app, compareResult.syncStatus.Revision, source, state.StartedAt)
 		if err != nil {
 			state.Phase = common.OperationError
 			state.Message = fmt.Sprintf("failed to record sync to history: %v", err)

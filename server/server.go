@@ -18,7 +18,6 @@ import (
 
 	"github.com/argoproj/gitops-engine/pkg/utils/errors"
 	"github.com/argoproj/gitops-engine/pkg/utils/io"
-	jsonutil "github.com/argoproj/gitops-engine/pkg/utils/json"
 	"github.com/argoproj/gitops-engine/pkg/utils/kube"
 	jwt "github.com/dgrijalva/jwt-go"
 	"github.com/go-redis/redis"
@@ -57,6 +56,7 @@ import (
 	applicationpkg "github.com/argoproj/argo-cd/pkg/apiclient/application"
 	certificatepkg "github.com/argoproj/argo-cd/pkg/apiclient/certificate"
 	clusterpkg "github.com/argoproj/argo-cd/pkg/apiclient/cluster"
+	gpgkeypkg "github.com/argoproj/argo-cd/pkg/apiclient/gpgkey"
 	projectpkg "github.com/argoproj/argo-cd/pkg/apiclient/project"
 	repocredspkg "github.com/argoproj/argo-cd/pkg/apiclient/repocreds"
 	repositorypkg "github.com/argoproj/argo-cd/pkg/apiclient/repository"
@@ -74,6 +74,7 @@ import (
 	servercache "github.com/argoproj/argo-cd/server/cache"
 	"github.com/argoproj/argo-cd/server/certificate"
 	"github.com/argoproj/argo-cd/server/cluster"
+	"github.com/argoproj/argo-cd/server/gpgkey"
 	"github.com/argoproj/argo-cd/server/metrics"
 	"github.com/argoproj/argo-cd/server/project"
 	"github.com/argoproj/argo-cd/server/rbacpolicy"
@@ -98,14 +99,10 @@ import (
 	tlsutil "github.com/argoproj/argo-cd/util/tls"
 )
 
-const (
-	maxConcurrentLoginRequestsCountEnv = "ARGOCD_MAX_CONCURRENT_LOGIN_REQUESTS_COUNT"
-)
+const maxConcurrentLoginRequestsCountEnv = "ARGOCD_MAX_CONCURRENT_LOGIN_REQUESTS_COUNT"
 
-var (
-	// ErrNoSession indicates no auth token was supplied as part of a request
-	ErrNoSession = status.Errorf(codes.Unauthenticated, "no session information")
-)
+// ErrNoSession indicates no auth token was supplied as part of a request
+var ErrNoSession = status.Errorf(codes.Unauthenticated, "no session information")
 
 var noCacheHeaders = map[string]string{
 	"Expires":         time.Unix(0, 0).Format(time.RFC1123),
@@ -450,6 +447,8 @@ func (a *ArgoCDServer) useTLS() bool {
 }
 
 func (a *ArgoCDServer) newGRPCServer() *grpc.Server {
+	grpc_prometheus.EnableHandlingTimeHistogram()
+
 	sOpts := []grpc.ServerOption{
 		// Set the both send and receive the bytes limit to be 100MB
 		// The proper way to achieve high performance is to have pagination
@@ -463,6 +462,7 @@ func (a *ArgoCDServer) newGRPCServer() *grpc.Server {
 		"/cluster.ClusterService/Update":                          true,
 		"/session.SessionService/Create":                          true,
 		"/account.AccountService/UpdatePassword":                  true,
+		"/gpgkey.GPGKeyService/CreateGnuPGPublicKey":              true,
 		"/repository.RepositoryService/Create":                    true,
 		"/repository.RepositoryService/Update":                    true,
 		"/repository.RepositoryService/CreateRepository":          true,
@@ -510,11 +510,12 @@ func (a *ArgoCDServer) newGRPCServer() *grpc.Server {
 	}
 	sessionService := session.NewServer(a.sessionMgr, a, a.policyEnforcer, loginRateLimiter)
 	projectLock := util.NewKeyLock()
-	applicationService := application.NewServer(a.Namespace, a.KubeClientset, a.AppClientset, a.appLister, a.RepoClientset, a.Cache, kubectl, db, a.enf, projectLock, a.settingsMgr)
+	applicationService := application.NewServer(a.Namespace, a.KubeClientset, a.AppClientset, a.appLister, a.appInformer, a.RepoClientset, a.Cache, kubectl, db, a.enf, projectLock, a.settingsMgr)
 	projectService := project.NewServer(a.Namespace, a.KubeClientset, a.AppClientset, a.enf, projectLock, a.sessionMgr, a.policyEnforcer)
-	settingsService := settings.NewServer(a.settingsMgr, a)
+	settingsService := settings.NewServer(a.settingsMgr, a, a.DisableAuth)
 	accountService := account.NewServer(a.sessionMgr, a.settingsMgr, a.enf)
 	certificateService := certificate.NewServer(a.RepoClientset, db, a.enf)
+	gpgkeyService := gpgkey.NewServer(a.RepoClientset, db, a.enf)
 	versionpkg.RegisterVersionServiceServer(grpcS, &version.Server{})
 	clusterpkg.RegisterClusterServiceServer(grpcS, clusterService)
 	applicationpkg.RegisterApplicationServiceServer(grpcS, applicationService)
@@ -525,9 +526,11 @@ func (a *ArgoCDServer) newGRPCServer() *grpc.Server {
 	projectpkg.RegisterProjectServiceServer(grpcS, projectService)
 	accountpkg.RegisterAccountServiceServer(grpcS, accountService)
 	certificatepkg.RegisterCertificateServiceServer(grpcS, certificateService)
+	gpgkeypkg.RegisterGPGKeyServiceServer(grpcS, gpgkeyService)
 	// Register reflection service on gRPC server.
 	reflection.Register(grpcS)
 	grpc_prometheus.Register(grpcS)
+	errors.CheckError(projectService.NormalizeProjs())
 	return grpcS
 }
 
@@ -613,7 +616,7 @@ func (a *ArgoCDServer) newHTTPServer(ctx context.Context, port int, grpcWebHandl
 	// golang/protobuf. Which does not support types such as time.Time. gogo/protobuf does support
 	// time.Time, but does not support custom UnmarshalJSON() and MarshalJSON() methods. Therefore
 	// we use our own Marshaler
-	gwMuxOpts := runtime.WithMarshalerOption(runtime.MIMEWildcard, new(jsonutil.JSONMarshaler))
+	gwMuxOpts := runtime.WithMarshalerOption(runtime.MIMEWildcard, new(grpc_util.JSONMarshaler))
 	gwCookieOpts := runtime.WithForwardResponseOption(a.translateGrpcCookieHeader)
 	gwmux := runtime.NewServeMux(gwMuxOpts, gwCookieOpts)
 	mux.Handle("/api/", gwmux)
@@ -627,6 +630,7 @@ func (a *ArgoCDServer) newHTTPServer(ctx context.Context, port int, grpcWebHandl
 	mustRegisterGWHandler(projectpkg.RegisterProjectServiceHandlerFromEndpoint, ctx, gwmux, endpoint, dOpts)
 	mustRegisterGWHandler(accountpkg.RegisterAccountServiceHandlerFromEndpoint, ctx, gwmux, endpoint, dOpts)
 	mustRegisterGWHandler(certificatepkg.RegisterCertificateServiceHandlerFromEndpoint, ctx, gwmux, endpoint, dOpts)
+	mustRegisterGWHandler(gpgkeypkg.RegisterGPGKeyServiceHandlerFromEndpoint, ctx, gwmux, endpoint, dOpts)
 
 	// Swagger UI
 	swagger.ServeSwaggerUI(mux, assets.SwaggerJSON, "/swagger-ui", a.RootPath)

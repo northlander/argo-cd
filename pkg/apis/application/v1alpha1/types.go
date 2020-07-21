@@ -17,11 +17,12 @@ import (
 
 	"github.com/argoproj/gitops-engine/pkg/health"
 	synccommon "github.com/argoproj/gitops-engine/pkg/sync/common"
+	"github.com/ghodss/yaml"
+	"github.com/google/go-cmp/cmp"
 	"github.com/robfig/cron"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"gopkg.in/yaml.v2"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -352,6 +353,8 @@ type ApplicationSourceJsonnet struct {
 	ExtVars []JsonnetVar `json:"extVars,omitempty" protobuf:"bytes,1,opt,name=extVars"`
 	// TLAS is a list of Jsonnet Top-level Arguments
 	TLAs []JsonnetVar `json:"tlas,omitempty" protobuf:"bytes,2,opt,name=tlas"`
+	// Additional library search dirs
+	Libs []string `json:"libs,omitempty" protobuf:"bytes,3,opt,name=libs"`
 }
 
 func (j *ApplicationSourceJsonnet) IsZero() bool {
@@ -402,6 +405,11 @@ type ApplicationDestination struct {
 	Server string `json:"server,omitempty" protobuf:"bytes,1,opt,name=server"`
 	// Namespace overrides the environment namespace value in the ksonnet app.yaml
 	Namespace string `json:"namespace,omitempty" protobuf:"bytes,2,opt,name=namespace"`
+	// Name of the destination cluster which can be used instead of server (url) field
+	Name string `json:"name,omitempty" protobuf:"bytes,3,opt,name=name"`
+
+	// nolint:govet
+	isServerInferred bool `json:"-"`
 }
 
 // ApplicationStatus contains information about application sync, health status
@@ -420,6 +428,15 @@ type ApplicationStatus struct {
 	Summary    ApplicationSummary    `json:"summary,omitempty" protobuf:"bytes,10,opt,name=summary"`
 }
 
+type JWTTokens struct {
+	Items []JWTToken `json:"items,omitempty" protobuf:"bytes,1,opt,name=items"`
+}
+
+// AppProjectStatus contains information about appproj
+type AppProjectStatus struct {
+	JWTTokensByRole map[string]JWTTokens `json:"jwtTokensByRole,omitempty" protobuf:"bytes,1,opt,name=jwtTokensByRole"`
+}
+
 // OperationInitiator holds information about the operation initiator
 type OperationInitiator struct {
 	// Name of a user who started operation.
@@ -432,17 +449,23 @@ type OperationInitiator struct {
 type Operation struct {
 	Sync        *SyncOperation     `json:"sync,omitempty" protobuf:"bytes,1,opt,name=sync"`
 	InitiatedBy OperationInitiator `json:"initiatedBy,omitempty" protobuf:"bytes,2,opt,name=initiatedBy"`
+	Info        []*Info            `json:"info,omitempty" protobuf:"bytes,3,name=info"`
 }
 
 // SyncOperationResource contains resources to sync.
 type SyncOperationResource struct {
-	Group string `json:"group,omitempty" protobuf:"bytes,1,opt,name=group"`
-	Kind  string `json:"kind" protobuf:"bytes,2,opt,name=kind"`
-	Name  string `json:"name" protobuf:"bytes,3,opt,name=name"`
+	Group     string `json:"group,omitempty" protobuf:"bytes,1,opt,name=group"`
+	Kind      string `json:"kind" protobuf:"bytes,2,opt,name=kind"`
+	Name      string `json:"name" protobuf:"bytes,3,opt,name=name"`
+	Namespace string `json:"namespace,omitempty" protobuf:"bytes,4,opt,name=namespace"`
 }
 
 // RevisionHistories is a array of history, oldest first and newest last
 type RevisionHistories []RevisionHistory
+
+func (in RevisionHistories) LastRevisionHistory() RevisionHistory {
+	return in[len(in)-1]
+}
 
 func (in RevisionHistories) Trunc(n int) RevisionHistories {
 	i := len(in) - n
@@ -452,9 +475,9 @@ func (in RevisionHistories) Trunc(n int) RevisionHistories {
 	return in
 }
 
-// HasIdentity determines whether a sync operation is identified by a manifest.
-func (r SyncOperationResource) HasIdentity(name string, gvk schema.GroupVersionKind) bool {
-	if name == r.Name && gvk.Kind == r.Kind && gvk.Group == r.Group {
+// HasIdentity determines whether a sync operation is identified by a manifest
+func (r SyncOperationResource) HasIdentity(name string, namespace string, gvk schema.GroupVersionKind) bool {
+	if name == r.Name && gvk.Kind == r.Kind && gvk.Group == r.Group && (r.Namespace == "" || namespace == r.Namespace) {
 		return true
 	}
 	return false
@@ -607,6 +630,9 @@ type RevisionMetadata struct {
 	// probably the commit message,
 	// this is truncated to the first newline or 64 characters (which ever comes first)
 	Message string `json:"message,omitempty" protobuf:"bytes,4,opt,name=message"`
+	// If revision was signed with GPG, and signature verification is enabled,
+	// this contains a hint on the signer
+	SignatureInfo string `json:"signatureInfo,omitempty" protobuf:"bytes,5,opt,name=signatureInfo"`
 }
 
 // SyncOperationResult represent result of sync operation
@@ -669,10 +695,15 @@ func (r ResourceResults) PruningRequired() (num int) {
 
 // RevisionHistory contains information relevant to an application deployment
 type RevisionHistory struct {
-	Revision   string            `json:"revision" protobuf:"bytes,2,opt,name=revision"`
-	DeployedAt metav1.Time       `json:"deployedAt" protobuf:"bytes,4,opt,name=deployedAt"`
-	ID         int64             `json:"id" protobuf:"bytes,5,opt,name=id"`
-	Source     ApplicationSource `json:"source,omitempty" protobuf:"bytes,6,opt,name=source"`
+	// Revision holds the revision of the sync
+	Revision string `json:"revision" protobuf:"bytes,2,opt,name=revision"`
+	// DeployedAt holds the time the deployment completed
+	DeployedAt metav1.Time `json:"deployedAt" protobuf:"bytes,4,opt,name=deployedAt"`
+	// ID is an auto incrementing identifier of the RevisionHistory
+	ID     int64             `json:"id" protobuf:"bytes,5,opt,name=id"`
+	Source ApplicationSource `json:"source,omitempty" protobuf:"bytes,6,opt,name=source"`
+	// DeployStartedAt holds the time the deployment started
+	DeployStartedAt *metav1.Time `json:"deployStartedAt,omitempty" protobuf:"bytes,7,opt,name=deployStartedAt"`
 }
 
 // ApplicationWatchEvent contains information about application change.
@@ -826,10 +857,16 @@ func (t *ApplicationTree) GetSummary() ApplicationSummary {
 	for url := range urlsSet {
 		urls = append(urls, url)
 	}
+	sort.Slice(urls, func(i, j int) bool {
+		return urls[i] < urls[j]
+	})
 	images := make([]string, 0)
 	for image := range imagesSet {
 		images = append(images, image)
 	}
+	sort.Slice(images, func(i, j int) bool {
+		return images[i] < images[j]
+	})
 	return ApplicationSummary{ExternalURLs: urls, Images: images}
 }
 
@@ -852,6 +889,7 @@ type ResourceNode struct {
 	ResourceVersion string                  `json:"resourceVersion,omitempty" protobuf:"bytes,5,opt,name=resourceVersion"`
 	Images          []string                `json:"images,omitempty" protobuf:"bytes,6,opt,name=images"`
 	Health          *HealthStatus           `json:"health,omitempty" protobuf:"bytes,7,opt,name=health"`
+	CreatedAt       *metav1.Time            `json:"createdAt,omitempty" protobuf:"bytes,8,opt,name=createdAt"`
 }
 
 func (n *ResourceNode) GroupKindVersion() schema.GroupVersionKind {
@@ -923,12 +961,47 @@ type Cluster struct {
 	Name string `json:"name" protobuf:"bytes,2,opt,name=name"`
 	// Config holds cluster information for connecting to a cluster
 	Config ClusterConfig `json:"config" protobuf:"bytes,3,opt,name=config"`
+	// DEPRECATED: use Info.ConnectionState field instead.
 	// ConnectionState contains information about cluster connection state
 	ConnectionState ConnectionState `json:"connectionState,omitempty" protobuf:"bytes,4,opt,name=connectionState"`
+	// DEPRECATED: use Info.ServerVersion field instead.
 	// The server version
 	ServerVersion string `json:"serverVersion,omitempty" protobuf:"bytes,5,opt,name=serverVersion"`
 	// Holds list of namespaces which are accessible in that cluster. Cluster level resources would be ignored if namespace list if not empty.
 	Namespaces []string `json:"namespaces,omitempty" protobuf:"bytes,6,opt,name=namespaces"`
+	// RefreshRequestedAt holds time when cluster cache refresh has been requested
+	RefreshRequestedAt *metav1.Time `json:"refreshRequestedAt,omitempty" protobuf:"bytes,7,opt,name=refreshRequestedAt"`
+	// Holds information about cluster cache
+	Info ClusterInfo `json:"info,omitempty" protobuf:"bytes,8,opt,name=info"`
+}
+
+func (c *Cluster) Equals(other *Cluster) bool {
+	if c.Server != other.Server {
+		return false
+	}
+	if c.Name != other.Name {
+		return false
+	}
+	if strings.Join(c.Namespaces, ",") != strings.Join(other.Namespaces, ",") {
+		return false
+	}
+	return reflect.DeepEqual(c.Config, other.Config)
+}
+
+type ClusterInfo struct {
+	ConnectionState   ConnectionState  `json:"connectionState,omitempty" protobuf:"bytes,1,opt,name=connectionState"`
+	ServerVersion     string           `json:"serverVersion,omitempty" protobuf:"bytes,2,opt,name=serverVersion"`
+	CacheInfo         ClusterCacheInfo `json:"cacheInfo,omitempty" protobuf:"bytes,3,opt,name=cacheInfo"`
+	ApplicationsCount int64            `json:"applicationsCount" protobuf:"bytes,4,opt,name=applicationsCount"`
+}
+
+type ClusterCacheInfo struct {
+	// ResourcesCount holds number of observed Kubernetes resources
+	ResourcesCount int64 `json:"resourcesCount,omitempty" protobuf:"bytes,1,opt,name=resourcesCount"`
+	// APIsCount holds number of observed Kubernetes API count
+	APIsCount int64 `json:"apisCount,omitempty" protobuf:"bytes,2,opt,name=apisCount"`
+	// LastCacheSyncTime holds time of most recent cache synchronization
+	LastCacheSyncTime *metav1.Time `json:"lastCacheSyncTime,omitempty" protobuf:"bytes,3,opt,name=lastCacheSyncTime"`
 }
 
 // ClusterList is a collection of Clusters.
@@ -990,12 +1063,43 @@ type KnownTypeField struct {
 	Type  string `json:"type,omitempty" protobuf:"bytes,2,opt,name=type"`
 }
 
+type OverrideIgnoreDiff struct {
+	JSONPointers []string `json:"jsonPointers" protobuf:"bytes,1,rep,name=jSONPointers"`
+}
+
+type rawResourceOverride struct {
+	HealthLua         string           `json:"health.lua,omitempty"`
+	Actions           string           `json:"actions,omitempty"`
+	IgnoreDifferences string           `json:"ignoreDifferences,omitempty"`
+	KnownTypeFields   []KnownTypeField `json:"knownTypeFields,omitempty"`
+}
+
 // ResourceOverride holds configuration to customize resource diffing and health assessment
 type ResourceOverride struct {
-	HealthLua         string           `json:"health.lua,omitempty" protobuf:"bytes,1,opt,name=healthLua"`
-	Actions           string           `json:"actions,omitempty" protobuf:"bytes,3,opt,name=actions"`
-	IgnoreDifferences string           `json:"ignoreDifferences,omitempty" protobuf:"bytes,2,opt,name=ignoreDifferences"`
-	KnownTypeFields   []KnownTypeField `json:"knownTypeFields,omitempty" protobuf:"bytes,4,opt,name=knownTypeFields"`
+	HealthLua         string             `protobuf:"bytes,1,opt,name=healthLua"`
+	Actions           string             `protobuf:"bytes,3,opt,name=actions"`
+	IgnoreDifferences OverrideIgnoreDiff `protobuf:"bytes,2,opt,name=ignoreDifferences"`
+	KnownTypeFields   []KnownTypeField   `protobuf:"bytes,4,opt,name=knownTypeFields"`
+}
+
+func (s *ResourceOverride) UnmarshalJSON(data []byte) error {
+	raw := &rawResourceOverride{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	s.KnownTypeFields = raw.KnownTypeFields
+	s.HealthLua = raw.HealthLua
+	s.Actions = raw.Actions
+	return yaml.Unmarshal([]byte(raw.IgnoreDifferences), &s.IgnoreDifferences)
+}
+
+func (s ResourceOverride) MarshalJSON() ([]byte, error) {
+	ignoreDifferencesData, err := yaml.Marshal(s.IgnoreDifferences)
+	if err != nil {
+		return nil, err
+	}
+	raw := &rawResourceOverride{s.HealthLua, s.Actions, string(ignoreDifferencesData), s.KnownTypeFields}
+	return json.Marshal(raw)
 }
 
 func (o *ResourceOverride) GetActions() (ResourceActions, error) {
@@ -1231,6 +1335,28 @@ type RepositoryCertificateList struct {
 	Items []RepositoryCertificate `json:"items" protobuf:"bytes,2,rep,name=items"`
 }
 
+// GnuPGPublicKey is a representation of a GnuPG public key
+type GnuPGPublicKey struct {
+	// KeyID in hexadecimal string format
+	KeyID string `json:"keyID" protobuf:"bytes,1,opt,name=keyID"`
+	// Fingerprint of the key
+	Fingerprint string `json:"fingerprint,omitempty" protobuf:"bytes,2,opt,name=fingerprint"`
+	// Owner identification
+	Owner string `json:"owner,omitempty" protobuf:"bytes,3,opt,name=owner"`
+	// Trust level
+	Trust string `json:"trust,omitempty" protobuf:"bytes,4,opt,name=trust"`
+	// Key sub type (e.g. rsa4096)
+	SubType string `json:"subType,omitempty" protobuf:"bytes,5,opt,name=subType"`
+	// Key data
+	KeyData string `json:"keyData,omitempty" protobuf:"bytes,6,opt,name=keyData"`
+}
+
+// GnuPGPublicKeyList is a collection of GnuPGPublicKey objects
+type GnuPGPublicKeyList struct {
+	metav1.ListMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+	Items           []GnuPGPublicKey `json:"items" protobuf:"bytes,2,rep,name=items"`
+}
+
 // AppProjectList is list of AppProject resources
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type AppProjectList struct {
@@ -1252,7 +1378,8 @@ type AppProjectList struct {
 type AppProject struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata" protobuf:"bytes,1,opt,name=metadata"`
-	Spec              AppProjectSpec `json:"spec" protobuf:"bytes,2,opt,name=spec"`
+	Spec              AppProjectSpec   `json:"spec" protobuf:"bytes,2,opt,name=spec"`
+	Status            AppProjectStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
 }
 
 // GetRoleByName returns the role in a project by the name with its index
@@ -1266,7 +1393,8 @@ func (p *AppProject) GetRoleByName(name string) (*ProjectRole, int, error) {
 }
 
 // GetJWTToken looks up the index of a JWTToken in a project by id (new token), if not then by the issue at time (old token)
-func (p *AppProject) GetJWTToken(roleName string, issuedAt int64, id string) (*JWTToken, int, error) {
+func (p *AppProject) GetJWTTokenFromSpec(roleName string, issuedAt int64, id string) (*JWTToken, int, error) {
+	// This is for backward compatibility. In the oder version, JWTTokens are stored under spec.role
 	role, _, err := p.GetRoleByName(roleName)
 	if err != nil {
 		return nil, -1, err
@@ -1289,6 +1417,54 @@ func (p *AppProject) GetJWTToken(roleName string, issuedAt int64, id string) (*J
 	}
 
 	return nil, -1, fmt.Errorf("JWT token for role '%s' issued at '%d' does not exist in project '%s'", role.Name, issuedAt, p.Name)
+}
+
+// GetJWTToken looks up the index of a JWTToken in a project by id (new token), if not then by the issue at time (old token)
+func (p *AppProject) GetJWTToken(roleName string, issuedAt int64, id string) (*JWTToken, int, error) {
+	// This is for newer version, JWTTokens are stored under status
+	if id != "" {
+		for i, token := range p.Status.JWTTokensByRole[roleName].Items {
+			if id == token.ID {
+				return &token, i, nil
+			}
+		}
+
+	}
+
+	if issuedAt != -1 {
+		for i, token := range p.Status.JWTTokensByRole[roleName].Items {
+			if issuedAt == token.IssuedAt {
+				return &token, i, nil
+			}
+		}
+	}
+
+	return nil, -1, fmt.Errorf("JWT token for role '%s' issued at '%d' does not exist in project '%s'", roleName, issuedAt, p.Name)
+}
+
+func (p AppProject) RemoveJWTToken(roleIndex int, issuedAt int64, id string) error {
+	roleName := p.Spec.Roles[roleIndex].Name
+	// For backward compatibility
+	_, jwtTokenIndex, err1 := p.GetJWTTokenFromSpec(roleName, issuedAt, id)
+	if err1 == nil {
+		p.Spec.Roles[roleIndex].JWTTokens[jwtTokenIndex] = p.Spec.Roles[roleIndex].JWTTokens[len(p.Spec.Roles[roleIndex].JWTTokens)-1]
+		p.Spec.Roles[roleIndex].JWTTokens = p.Spec.Roles[roleIndex].JWTTokens[:len(p.Spec.Roles[roleIndex].JWTTokens)-1]
+	}
+
+	// New location for storing JWTToken
+	_, jwtTokenIndex, err2 := p.GetJWTToken(roleName, issuedAt, id)
+	if err2 == nil {
+		p.Status.JWTTokensByRole[roleName].Items[jwtTokenIndex] = p.Status.JWTTokensByRole[roleName].Items[len(p.Status.JWTTokensByRole[roleName].Items)-1]
+		p.Status.JWTTokensByRole[roleName] = JWTTokens{Items: p.Status.JWTTokensByRole[roleName].Items[:len(p.Status.JWTTokensByRole[roleName].Items)-1]}
+	}
+
+	if err1 == nil || err2 == nil {
+		//If we find this token from either places, we can say there are no error
+		return nil
+	} else {
+		//If we could not locate this taken from either places, we can return any of the errors
+		return err2
+	}
 }
 
 func (p *AppProject) ValidateJWTTokenID(roleName string, id string) error {
@@ -1517,11 +1693,24 @@ func (p *AppProject) normalizePolicy(policy string) string {
 // OrphanedResourcesMonitorSettings holds settings of orphaned resources monitoring
 type OrphanedResourcesMonitorSettings struct {
 	// Warn indicates if warning condition should be created for apps which have orphaned resources
-	Warn *bool `json:"warn,omitempty" protobuf:"bytes,1,name=warn"`
+	Warn   *bool                 `json:"warn,omitempty" protobuf:"bytes,1,name=warn"`
+	Ignore []OrphanedResourceKey `json:"ignore,omitempty" protobuf:"bytes,2,opt,name=ignore"`
+}
+
+type OrphanedResourceKey struct {
+	Group string `json:"group,omitempty" protobuf:"bytes,1,opt,name=group"`
+	Kind  string `json:"kind,omitempty" protobuf:"bytes,2,opt,name=kind"`
+	Name  string `json:"name,omitempty" protobuf:"bytes,3,opt,name=name"`
 }
 
 func (s *OrphanedResourcesMonitorSettings) IsWarn() bool {
 	return s.Warn == nil || *s.Warn
+}
+
+// SignatureKey is the specification of a key required to verify commit signatures with
+type SignatureKey struct {
+	// The ID of the key in hexadecimal notation
+	KeyID string `json:"keyID" protobuf:"bytes,1,name=keyID"`
 }
 
 // AppProjectSpec is the specification of an AppProject
@@ -1544,6 +1733,8 @@ type AppProjectSpec struct {
 	SyncWindows SyncWindows `json:"syncWindows,omitempty" protobuf:"bytes,8,opt,name=syncWindows"`
 	// NamespaceResourceWhitelist contains list of whitelisted namespace level resources
 	NamespaceResourceWhitelist []metav1.GroupKind `json:"namespaceResourceWhitelist,omitempty" protobuf:"bytes,9,opt,name=namespaceResourceWhitelist"`
+	// List of PGP key IDs that commits to be synced to must be signed with
+	SignatureKeys []SignatureKey `json:"signatureKeys,omitempty" protobuf:"bytes,10,opt,name=signatureKeys"`
 }
 
 // SyncWindows is a collection of sync windows in this project
@@ -2237,4 +2428,95 @@ func (r ResourceDiff) LiveObject() (*unstructured.Unstructured, error) {
 
 func (r ResourceDiff) TargetObject() (*unstructured.Unstructured, error) {
 	return UnmarshalToUnstructured(r.TargetState)
+}
+
+func (d *ApplicationDestination) SetInferredServer(server string) {
+	d.isServerInferred = true
+	d.Server = server
+}
+
+func (d *ApplicationDestination) IsServerInferred() bool {
+	return d.isServerInferred
+}
+
+func (d *ApplicationDestination) MarshalJSON() ([]byte, error) {
+	type Alias ApplicationDestination
+	dest := d
+	if d.isServerInferred {
+		dest = dest.DeepCopy()
+		dest.Server = ""
+	}
+	return json.Marshal(&struct{ *Alias }{Alias: (*Alias)(dest)})
+}
+
+func (proj *AppProject) NormalizeJWTTokens() bool {
+	needNormalize := false
+	for i, role := range proj.Spec.Roles {
+		for j, token := range role.JWTTokens {
+			if token.ID == "" {
+				token.ID = strconv.FormatInt(token.IssuedAt, 10)
+				role.JWTTokens[j] = token
+				needNormalize = true
+			}
+		}
+		proj.Spec.Roles[i] = role
+	}
+	for _, roleTokenEntry := range proj.Status.JWTTokensByRole {
+		for j, token := range roleTokenEntry.Items {
+			if token.ID == "" {
+				token.ID = strconv.FormatInt(token.IssuedAt, 10)
+				roleTokenEntry.Items[j] = token
+				needNormalize = true
+			}
+		}
+	}
+	needSync := syncJWTTokenBetweenStatusAndSpec(proj)
+	return needNormalize || needSync
+}
+
+func syncJWTTokenBetweenStatusAndSpec(proj *AppProject) bool {
+	needSync := false
+	for roleIndex, role := range proj.Spec.Roles {
+		tokensInSpec := role.JWTTokens
+		tokensInStatus := []JWTToken{}
+		if proj.Status.JWTTokensByRole == nil {
+			tokensByRole := make(map[string]JWTTokens)
+			proj.Status.JWTTokensByRole = tokensByRole
+		} else {
+			tokensInStatus = proj.Status.JWTTokensByRole[role.Name].Items
+		}
+		tokens := jwtTokensCombine(tokensInStatus, tokensInSpec)
+
+		sort.Slice(proj.Spec.Roles[roleIndex].JWTTokens, func(i, j int) bool {
+			return proj.Spec.Roles[roleIndex].JWTTokens[i].IssuedAt > proj.Spec.Roles[roleIndex].JWTTokens[j].IssuedAt
+		})
+		sort.Slice(proj.Status.JWTTokensByRole[role.Name].Items, func(i, j int) bool {
+			return proj.Status.JWTTokensByRole[role.Name].Items[i].IssuedAt > proj.Status.JWTTokensByRole[role.Name].Items[j].IssuedAt
+		})
+		if !cmp.Equal(tokens, proj.Spec.Roles[roleIndex].JWTTokens) || !cmp.Equal(tokens, proj.Status.JWTTokensByRole[role.Name].Items) {
+			needSync = true
+		}
+
+		proj.Spec.Roles[roleIndex].JWTTokens = tokens
+		proj.Status.JWTTokensByRole[role.Name] = JWTTokens{Items: tokens}
+
+	}
+	return needSync
+}
+
+func jwtTokensCombine(tokens1 []JWTToken, tokens2 []JWTToken) []JWTToken {
+	tokensMap := make(map[string]JWTToken)
+	for _, token := range append(tokens1, tokens2...) {
+		tokensMap[token.ID] = token
+	}
+
+	tokens := []JWTToken{}
+	for _, v := range tokensMap {
+		tokens = append(tokens, v)
+	}
+
+	sort.Slice(tokens, func(i, j int) bool {
+		return tokens[i].IssuedAt > tokens[j].IssuedAt
+	})
+	return tokens
 }

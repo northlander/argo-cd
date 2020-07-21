@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/utils/pointer"
 
 	"github.com/argoproj/argo-cd/common"
 	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
@@ -307,6 +308,10 @@ func TestUseJWTToken(t *testing.T) {
 	_, err = fixture.RunCli("proj", "role", "create", projectName, roleName)
 	assert.NoError(t, err)
 
+	roleGetResult, err := fixture.RunCli("proj", "role", "get", projectName, roleName)
+	assert.NoError(t, err)
+	assert.True(t, strings.HasSuffix(roleGetResult, "ID  ISSUED-AT  EXPIRES-AT"))
+
 	_, err = fixture.RunCli("proj", "role", "create-token", projectName, roleName)
 	assert.NoError(t, err)
 
@@ -314,4 +319,104 @@ func TestUseJWTToken(t *testing.T) {
 		_, err = fixture.RunCli("proj", "role", "add-policy", projectName, roleName, "-a", action, "-o", "*", "-p", "allow")
 		assert.NoError(t, err)
 	}
+
+	newProj, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Get(projectName, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Len(t, newProj.Status.JWTTokensByRole[roleName].Items, 1)
+	assert.ElementsMatch(t, newProj.Status.JWTTokensByRole[roleName].Items, newProj.Spec.Roles[0].JWTTokens)
+
+	roleGetResult, err = fixture.RunCli("proj", "role", "get", projectName, roleName)
+	assert.NoError(t, err)
+	assert.True(t, strings.Contains(roleGetResult, strconv.FormatInt((newProj.Status.JWTTokensByRole[roleName].Items[0].IssuedAt), 10)))
+
+	_, err = fixture.RunCli("proj", "role", "delete-token", projectName, roleName, strconv.FormatInt((newProj.Status.JWTTokensByRole[roleName].Items[0].IssuedAt), 10))
+	assert.NoError(t, err)
+	newProj, err = fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Get(projectName, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Nil(t, newProj.Status.JWTTokensByRole[roleName].Items)
+	assert.Nil(t, newProj.Spec.Roles[0].JWTTokens)
+
+}
+
+func TestAddOrphanedIgnore(t *testing.T) {
+	fixture.EnsureCleanState(t)
+
+	projectName := "proj-" + strconv.FormatInt(time.Now().Unix(), 10)
+	_, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Create(&v1alpha1.AppProject{ObjectMeta: metav1.ObjectMeta{Name: projectName}})
+	if err != nil {
+		t.Fatalf("Unable to create project %v", err)
+	}
+
+	_, err = fixture.RunCli("proj", "add-orphaned-ignore", projectName,
+		"group",
+		"kind",
+		"name",
+	)
+
+	if err != nil {
+		t.Fatalf("Unable to add resource to orphaned ignore %v", err)
+	}
+
+	_, err = fixture.RunCli("proj", "add-orphaned-ignore", projectName,
+		"group",
+		"kind",
+		"name",
+	)
+	assert.Error(t, err)
+	assert.True(t, strings.Contains(err.Error(), "already defined"))
+
+	proj, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Get(projectName, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, projectName, proj.Name)
+	assert.Equal(t, 1, len(proj.Spec.OrphanedResources.Ignore))
+
+	assert.Equal(t, "group", proj.Spec.OrphanedResources.Ignore[0].Group)
+	assert.Equal(t, "kind", proj.Spec.OrphanedResources.Ignore[0].Kind)
+	assert.Equal(t, "name", proj.Spec.OrphanedResources.Ignore[0].Name)
+	assertProjHasEvent(t, proj, "update", argo.EventReasonResourceUpdated)
+}
+
+func TestRemoveOrphanedIgnore(t *testing.T) {
+	fixture.EnsureCleanState(t)
+
+	projectName := "proj-" + strconv.FormatInt(time.Now().Unix(), 10)
+	_, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Create(&v1alpha1.AppProject{
+		ObjectMeta: metav1.ObjectMeta{Name: projectName},
+		Spec: v1alpha1.AppProjectSpec{
+			OrphanedResources: &v1alpha1.OrphanedResourcesMonitorSettings{
+				Warn:   pointer.BoolPtr(true),
+				Ignore: []v1alpha1.OrphanedResourceKey{{Group: "group", Kind: "kind", Name: "name"}},
+			},
+		},
+	})
+
+	if err != nil {
+		t.Fatalf("Unable to create project %v", err)
+	}
+
+	_, err = fixture.RunCli("proj", "remove-orphaned-ignore", projectName,
+		"group",
+		"kind",
+		"name",
+	)
+
+	if err != nil {
+		t.Fatalf("Unable to remove resource from orphaned ignore list %v", err)
+	}
+
+	_, err = fixture.RunCli("proj", "remove-orphaned-ignore", projectName,
+		"group",
+		"kind",
+		"name",
+	)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "does not exist")
+
+	proj, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Get(projectName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Unable to get project %v", err)
+	}
+	assert.Equal(t, projectName, proj.Name)
+	assert.Equal(t, 0, len(proj.Spec.OrphanedResources.Ignore))
+	assertProjHasEvent(t, proj, "update", argo.EventReasonResourceUpdated)
 }

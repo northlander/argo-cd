@@ -32,7 +32,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	// make sure to register workqueue prometheus metrics
-	_ "k8s.io/kubernetes/pkg/util/workqueue/prometheus"
+	_ "k8s.io/component-base/metrics/prometheus/workqueue"
 
 	"github.com/argoproj/argo-cd/common"
 	statecache "github.com/argoproj/argo-cd/controller/cache"
@@ -47,6 +47,7 @@ import (
 	"github.com/argoproj/argo-cd/util/argo"
 	appstatecache "github.com/argoproj/argo-cd/util/cache/appstate"
 	"github.com/argoproj/argo-cd/util/db"
+	"github.com/argoproj/argo-cd/util/glob"
 	settings_util "github.com/argoproj/argo-cd/util/settings"
 )
 
@@ -215,7 +216,7 @@ func (ctrl *ApplicationController) handleObjectUpdated(managedByApp map[string]b
 				}
 				// exclude resource unless it is permitted in the app project. If project is not permitted then it is not controlled by the user and there is no point showing the warning.
 				if proj, err := ctrl.getAppProj(app); err == nil && proj.IsGroupKindPermitted(ref.GroupVersionKind().GroupKind(), true) &&
-					!isKnownOrphanedResourceExclusion(kube.NewResourceKey(ref.GroupVersionKind().Group, ref.GroupVersionKind().Kind, ref.Namespace, ref.Name)) {
+					!isKnownOrphanedResourceExclusion(kube.NewResourceKey(ref.GroupVersionKind().Group, ref.GroupVersionKind().Kind, ref.Namespace, ref.Name), proj) {
 
 					managedByApp[app.Name] = false
 				}
@@ -254,12 +255,22 @@ func (ctrl *ApplicationController) setAppManagedResources(a *appv1.Application, 
 }
 
 // returns true of given resources exist in the namespace by default and not managed by the user
-func isKnownOrphanedResourceExclusion(key kube.ResourceKey) bool {
+func isKnownOrphanedResourceExclusion(key kube.ResourceKey, proj *appv1.AppProject) bool {
 	if key.Namespace == "default" && key.Group == "" && key.Kind == kube.ServiceKind && key.Name == "kubernetes" {
 		return true
 	}
 	if key.Group == "" && key.Kind == kube.ServiceAccountKind && key.Name == "default" {
 		return true
+	}
+	list := proj.Spec.OrphanedResources.Ignore
+	for _, item := range list {
+		if item.Kind == "" || glob.Match(item.Kind, key.Kind) {
+			if glob.Match(item.Group, key.Group) {
+				if item.Name == "" || glob.Match(item.Name, key.Name) {
+					return true
+				}
+			}
+		}
 	}
 	return false
 }
@@ -316,7 +327,7 @@ func (ctrl *ApplicationController) getResourceTree(a *appv1.Application, managed
 	}
 	orphanedNodes := make([]appv1.ResourceNode, 0)
 	for k := range orphanedNodesMap {
-		if k.Namespace != "" && proj.IsGroupKindPermitted(k.GroupKind(), true) && !isKnownOrphanedResourceExclusion(k) {
+		if k.Namespace != "" && proj.IsGroupKindPermitted(k.GroupKind(), true) && !isKnownOrphanedResourceExclusion(k, proj) {
 			err := ctrl.stateCache.IterateHierarchy(a.Spec.Destination.Server, k, func(child appv1.ResourceNode, appName string) {
 				belongToAnotherApp := false
 				if appName != "" {
@@ -395,11 +406,6 @@ func (ctrl *ApplicationController) managedResources(comparisonResult *comparison
 		} else {
 			item.TargetState = "null"
 		}
-		jsonDiff, err := resDiff.JSONFormat()
-		if err != nil {
-			return nil, err
-		}
-		item.Diff = jsonDiff
 		item.PredictedLiveState = string(resDiff.PredictedLive)
 		item.NormalizedLiveState = string(resDiff.NormalizedLive)
 
@@ -420,6 +426,8 @@ func (ctrl *ApplicationController) Run(ctx context.Context, statusProcessors int
 
 	go ctrl.appInformer.Run(ctx.Done())
 	go ctrl.projInformer.Run(ctx.Done())
+
+	errors.CheckError(ctrl.stateCache.Init())
 
 	if !cache.WaitForCacheSync(ctx.Done(), ctrl.appInformer.HasSynced, ctrl.projInformer.HasSynced) {
 		log.Error("Timed out waiting for caches to sync")
@@ -593,7 +601,12 @@ func (ctrl *ApplicationController) finalizeApplicationDeletion(app *appv1.Applic
 
 	objs := make([]*unstructured.Unstructured, 0)
 	for k := range objsMap {
-		if ctrl.shouldBeDeleted(app, objsMap[k]) && objsMap[k].GetDeletionTimestamp() == nil {
+		// Wait for objects pending deletion to complete before proceeding with next sync wave
+		if objsMap[k].GetDeletionTimestamp() != nil {
+			logCtx.Infof("%d objects remaining for deletion", len(objsMap))
+			return objs, nil
+		}
+		if ctrl.shouldBeDeleted(app, objsMap[k]) {
 			objs = append(objs, objsMap[k])
 		}
 	}
@@ -604,8 +617,9 @@ func (ctrl *ApplicationController) finalizeApplicationDeletion(app *appv1.Applic
 	}
 	config := metrics.AddMetricsTransportWrapper(ctrl.metricsServer, app, cluster.RESTConfig())
 
-	err = kube.RunAllAsync(len(objs), func(i int) error {
-		obj := objs[i]
+	filteredObjs := FilterObjectsForDeletion(objs)
+	err = kube.RunAllAsync(len(filteredObjs), func(i int) error {
+		obj := filteredObjs[i]
 		return ctrl.kubectl.DeleteResource(config, obj.GroupVersionKind(), obj.GetName(), obj.GetNamespace(), false)
 	})
 	if err != nil {
@@ -706,7 +720,12 @@ func (ctrl *ApplicationController) processRequestedAppOperation(app *appv1.Appli
 		logCtx.Infof("Initialized new operation: %v", *app.Operation)
 	}
 
-	ctrl.appStateManager.SyncAppState(app, state)
+	if err := argo.ValidateDestination(context.Background(), &app.Spec.Destination, ctrl.db); err != nil {
+		state.Phase = synccommon.OperationFailed
+		state.Message = err.Error()
+	} else {
+		ctrl.appStateManager.SyncAppState(app, state)
+	}
 
 	if state.Phase == synccommon.OperationRunning {
 		// It's possible for an app to be terminated while we were operating on it. We do not want
@@ -724,7 +743,7 @@ func (ctrl *ApplicationController) processRequestedAppOperation(app *appv1.Appli
 	}
 
 	ctrl.setOperationState(app, state)
-	if state.Phase.Completed() {
+	if state.Phase.Completed() && !app.Operation.Sync.DryRun {
 		// if we just completed an operation, force a refresh so that UI will report up-to-date
 		// sync/health information
 		if _, err := cache.MetaNamespaceKeyFunc(app); err == nil {
@@ -827,6 +846,7 @@ func (ctrl *ApplicationController) processAppRefreshQueueItem() (processNext boo
 		log.Warnf("Key '%s' in index is not an application", appKey)
 		return
 	}
+	origApp = origApp.DeepCopy()
 	needRefresh, refreshType, comparisonLevel := ctrl.needRefreshAppStatus(origApp, ctrl.statusRefreshTimeout)
 
 	if !needRefresh {
@@ -843,6 +863,7 @@ func (ctrl *ApplicationController) processAppRefreshQueueItem() (processNext boo
 			"time_ms":        reconcileDuration.Milliseconds(),
 			"level":          comparisonLevel,
 			"dest-server":    origApp.Spec.Destination.Server,
+			"dest-name":      origApp.Spec.Destination.Name,
 			"dest-namespace": origApp.Spec.Destination.Namespace,
 		}).Info("Reconciliation completed")
 	}()
@@ -996,6 +1017,13 @@ func (ctrl *ApplicationController) refreshAppConditions(app *appv1.Application) 
 			})
 		}
 	} else {
+		if err := argo.ValidateDestination(context.Background(), &app.Spec.Destination, ctrl.db); err != nil {
+			errorConditions = append(errorConditions, appv1.ApplicationCondition{
+				Message: err.Error(),
+				Type:    appv1.ApplicationConditionInvalidSpecError,
+			})
+		}
+
 		specConditions, err := argo.ValidatePermissions(context.Background(), &app.Spec, proj, ctrl.db)
 		if err != nil {
 			errorConditions = append(errorConditions, appv1.ApplicationCondition{
@@ -1257,7 +1285,7 @@ func (ctrl *ApplicationController) newApplicationInformerAndLister() (cache.Shar
 }
 
 func (ctrl *ApplicationController) RegisterClusterSecretUpdater(ctx context.Context) {
-	updater := &clusterSecretUpdater{infoSource: ctrl.stateCache, db: ctrl.db}
+	updater := NewClusterInfoUpdater(ctrl.stateCache, ctrl.db, ctrl.appLister.Applications(ctrl.namespace), ctrl.cache)
 	go updater.Run(ctx)
 }
 

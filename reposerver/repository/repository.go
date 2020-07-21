@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -37,6 +38,7 @@ import (
 	"github.com/argoproj/argo-cd/util/app/discovery"
 	argopath "github.com/argoproj/argo-cd/util/app/path"
 	"github.com/argoproj/argo-cd/util/git"
+	"github.com/argoproj/argo-cd/util/gpg"
 	"github.com/argoproj/argo-cd/util/helm"
 	"github.com/argoproj/argo-cd/util/ksonnet"
 	argokube "github.com/argoproj/argo-cd/util/kube"
@@ -118,13 +120,15 @@ func (s *Service) runRepoOperation(
 	revision string,
 	repo *v1alpha1.Repository,
 	source *v1alpha1.ApplicationSource,
+	verifyCommit bool,
 	getCached func(revision string) bool,
-	operation func(appPath, repoRoot, revision string) error,
+	operation func(appPath, repoRoot, revision, verifyResult string) error,
 	settings operationSettings) error {
 
 	var gitClient git.Client
 	var helmClient helm.Client
 	var err error
+	var signature string
 	revision = textutils.FirstNonEmpty(revision, source.TargetRevision)
 	if source.IsHelm() {
 		helmClient, revision, err = s.newHelmClientResolveRevision(repo, revision, source.Chart)
@@ -169,7 +173,7 @@ func (s *Service) runRepoOperation(
 			return err
 		}
 		defer io.Close(closer)
-		return operation(chartPath, chartPath, revision)
+		return operation(chartPath, chartPath, revision, "")
 	} else {
 		s.repoLock.Lock(gitClient.Root())
 		defer s.repoLock.Unlock(gitClient.Root())
@@ -181,11 +185,17 @@ func (s *Service) runRepoOperation(
 		if err != nil {
 			return err
 		}
+		if verifyCommit {
+			signature, err = gitClient.VerifyCommitSignature(revision)
+			if err != nil {
+				return err
+			}
+		}
 		appPath, err := argopath.Path(gitClient.Root(), source.Path)
 		if err != nil {
 			return err
 		}
-		return operation(appPath, gitClient.Root(), revision)
+		return operation(appPath, gitClient.Root(), revision, signature)
 	}
 }
 
@@ -205,13 +215,14 @@ func (s *Service) GenerateManifest(ctx context.Context, q *apiclient.ManifestReq
 		}
 		return false
 	}
-	err := s.runRepoOperation(ctx, q.Revision, q.Repo, q.ApplicationSource, getCached, func(appPath, repoRoot, revision string) error {
+	err := s.runRepoOperation(ctx, q.Revision, q.Repo, q.ApplicationSource, q.VerifySignature, getCached, func(appPath, repoRoot, revision, verifyResult string) error {
 		var err error
 		res, err = GenerateManifests(appPath, repoRoot, revision, q, false)
 		if err != nil {
 			return err
 		}
 		res.Revision = revision
+		res.VerifyResult = verifyResult
 		err = s.cache.SetManifests(revision, q.ApplicationSource, q.Namespace, q.AppLabelKey, q.AppLabelValue, &res)
 		if err != nil {
 			log.Warnf("manifest cache set error %s/%s: %v", q.ApplicationSource.String(), revision, err)
@@ -335,7 +346,7 @@ func helmTemplate(appPath string, repoRoot string, env *v1alpha1.Env, q *apiclie
 			return nil, err
 		}
 	}
-	return kube.SplitYAML(out)
+	return kube.SplitYAML([]byte(out))
 }
 
 // GenerateManifests generates manifests from a path
@@ -372,7 +383,7 @@ func GenerateManifests(appPath, repoRoot, revision string, q *apiclient.Manifest
 		if directory = q.ApplicationSource.Directory; directory == nil {
 			directory = &v1alpha1.ApplicationSourceDirectory{}
 		}
-		targetObjs, err = findManifests(appPath, env, *directory)
+		targetObjs, err = findManifests(appPath, repoRoot, env, *directory)
 	}
 	if err != nil {
 		return nil, err
@@ -507,7 +518,7 @@ func ksShow(appLabelKey, appPath string, ksonnetOpts *v1alpha1.ApplicationSource
 var manifestFile = regexp.MustCompile(`^.*\.(yaml|yml|json|jsonnet)$`)
 
 // findManifests looks at all yaml files in a directory and unmarshals them into a list of unstructured objects
-func findManifests(appPath string, env *v1alpha1.Env, directory v1alpha1.ApplicationSourceDirectory) ([]*unstructured.Unstructured, error) {
+func findManifests(appPath string, repoRoot string, env *v1alpha1.Env, directory v1alpha1.ApplicationSourceDirectory) ([]*unstructured.Unstructured, error) {
 	var objs []*unstructured.Unstructured
 	err := filepath.Walk(appPath, func(path string, f os.FileInfo, err error) error {
 		if err != nil {
@@ -536,10 +547,10 @@ func findManifests(appPath string, env *v1alpha1.Env, directory v1alpha1.Applica
 			}
 			objs = append(objs, &obj)
 		} else if strings.HasSuffix(f.Name(), ".jsonnet") {
-			vm := makeJsonnetVm(directory.Jsonnet, env)
-			vm.Importer(&jsonnet.FileImporter{
-				JPaths: []string{appPath},
-			})
+			vm, err := makeJsonnetVm(appPath, repoRoot, directory.Jsonnet, env)
+			if err != nil {
+				return err
+			}
 			jsonStr, err := vm.EvaluateSnippet(path, string(out))
 			if err != nil {
 				return status.Errorf(codes.FailedPrecondition, "Failed to evaluate jsonnet %q: %v", f.Name(), err)
@@ -559,7 +570,7 @@ func findManifests(appPath string, env *v1alpha1.Env, directory v1alpha1.Applica
 				objs = append(objs, &jsonObj)
 			}
 		} else {
-			yamlObjs, err := kube.SplitYAML(string(out))
+			yamlObjs, err := kube.SplitYAML(out)
 			if err != nil {
 				if len(yamlObjs) > 0 {
 					// If we get here, we had a multiple objects in a single YAML file which had some
@@ -580,7 +591,8 @@ func findManifests(appPath string, env *v1alpha1.Env, directory v1alpha1.Applica
 	return objs, nil
 }
 
-func makeJsonnetVm(sourceJsonnet v1alpha1.ApplicationSourceJsonnet, env *v1alpha1.Env) *jsonnet.VM {
+func makeJsonnetVm(appPath string, repoRoot string, sourceJsonnet v1alpha1.ApplicationSourceJsonnet, env *v1alpha1.Env) (*jsonnet.VM, error) {
+
 	vm := jsonnet.MakeVM()
 	for i, j := range sourceJsonnet.TLAs {
 		sourceJsonnet.TLAs[i].Value = env.Envsubst(j.Value)
@@ -603,7 +615,21 @@ func makeJsonnetVm(sourceJsonnet v1alpha1.ApplicationSourceJsonnet, env *v1alpha
 		}
 	}
 
-	return vm
+	// Jsonnet Imports relative to the repository path
+	jpaths := []string{appPath}
+	for _, p := range sourceJsonnet.Libs {
+		jpath := path.Join(repoRoot, p)
+		if !strings.HasPrefix(jpath, repoRoot) {
+			return nil, status.Errorf(codes.FailedPrecondition, "%s: referenced library points outside the repository", p)
+		}
+		jpaths = append(jpaths, jpath)
+	}
+
+	vm.Importer(&jsonnet.FileImporter{
+		JPaths: jpaths,
+	})
+
+	return vm, nil
 }
 
 func runCommand(command v1alpha1.Command, path string, env []string) (string, error) {
@@ -652,7 +678,7 @@ func runConfigManagementPlugin(appPath string, envVars *v1alpha1.Env, q *apiclie
 	if err != nil {
 		return nil, err
 	}
-	return kube.SplitYAML(out)
+	return kube.SplitYAML([]byte(out))
 }
 
 func (s *Service) GetAppDetails(ctx context.Context, q *apiclient.RepoServerAppDetailsQuery) (*apiclient.RepoAppDetailsResponse, error) {
@@ -672,7 +698,7 @@ func (s *Service) GetAppDetails(ctx context.Context, q *apiclient.RepoServerAppD
 		return false
 	}
 
-	err := s.runRepoOperation(ctx, q.Source.TargetRevision, q.Repo, q.Source, getCached, func(appPath, repoRoot, revision string) error {
+	err := s.runRepoOperation(ctx, q.Source.TargetRevision, q.Repo, q.Source, false, getCached, func(appPath, repoRoot, revision, verifyResult string) error {
 		appSourceType, err := GetAppSourceType(q.Source, appPath)
 		if err != nil {
 			return err
@@ -810,9 +836,31 @@ func (s *Service) GetRevisionMetadata(ctx context.Context, q *apiclient.RepoServ
 	if err != nil {
 		return nil, err
 	}
+
+	// Run gpg verify-commit on the revision
+	signatureInfo := ""
+	if gpg.IsGPGEnabled() {
+		cs, err := gitClient.VerifyCommitSignature(q.Revision)
+		if err != nil {
+			log.Debugf("Could not verify commit signature: %v", err)
+			return nil, err
+		}
+
+		if cs != "" {
+			vr, err := gpg.ParseGitCommitVerification(cs)
+			if err != nil {
+				log.Debugf("Could not parse commit verification: %v", err)
+				return nil, err
+			}
+			signatureInfo = fmt.Sprintf("%s signature from %s key %s", vr.Result, vr.Cipher, gpg.KeyID(vr.KeyID))
+		} else {
+			signatureInfo = "Revision is not signed."
+		}
+	}
+
 	// discard anything after the first new line and then truncate to 64 chars
 	message := text.Trunc(strings.SplitN(m.Message, "\n", 2)[0], 64)
-	metadata = &v1alpha1.RevisionMetadata{Author: m.Author, Date: metav1.Time{Time: m.Date}, Tags: m.Tags, Message: message}
+	metadata = &v1alpha1.RevisionMetadata{Author: m.Author, Date: metav1.Time{Time: m.Date}, Tags: m.Tags, Message: message, SignatureInfo: signatureInfo}
 	_ = s.cache.SetRevisionMetadata(q.Repo.Repo, q.Revision, metadata)
 	return metadata, nil
 }
