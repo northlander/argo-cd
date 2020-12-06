@@ -1,5 +1,180 @@
 # Changelog
 
+## v1.8.0 (Unreleased)
+
+### Mono-Repository Improvements
+
+Enhanced performance during manifest generation from mono-repository - the repository that represents the
+desired state of the whole cluster and contains hundreds of applications. The improved argocd-repo-server
+now able to concurrently generate manifests from the same repository and for the same commit SHA. This
+might provide 10x performance improvement of manifests generation.
+
+### Annotation Based Path Detection
+
+The feature that allows specifying which source repository directories influence the application manifest generation
+using the `argocd.argoproj.io/manifest-generate-paths` annotation. The annotation improves the Git webhook handler
+behavior. The webhook avoids related applications reconciliation if no related files have been changed by the Git commit
+and even allows to skip manifests generation for new commit by re-using generation manifests for the previous commit.
+
+### Horizontal Controller Scaling
+
+This release allows scaling the `argocd-application-controller` horizontally. This allows you to manage as many Kubernetes clusters
+as needed using a single Argo CD instance.
+
+## New Core Functionality Features
+
+Besides performance improvements, Argo CD got a lot of usability enhancements and new features:
+
+* Namespace and CRD creation [#4354](https://github.com/argoproj/argo-cd/issues/4354)
+* Unknown fields of built-in K8S types [#1787](https://github.com/argoproj/argo-cd/issues/1787)
+* Endpoints Diffing [#1816](https://github.com/argoproj/argo-cd/issues/1816)
+* Better compatibility with Helm Hooks [#1816](https://github.com/argoproj/argo-cd/issues/1816)
+* App-of-Apps Health Assessment [#3781](https://github.com/argoproj/argo-cd/issues/3781)
+
+## Global Projects
+
+This release makes it easy to manage an Argo CD that has hundreds of Projects. Instead of duplicating the same organization-wide rules in all projects
+you can put such rules into one project and make this project “global” for all other projects. Rules defined in the global project are inherited by all
+other projects and therefore don’t have to be duplicated. The sample below demonstrates how you can create a global project and specify which project should
+inherit global project rules using Kubernetes labels. 
+
+## User Interface Improvements
+
+The Argo CD user interface is an important part of a project and we keep working hard on improving the user experience. Here is an incomplete list of implemented improvements:
+
+* Improved Applications Filters [#4622](https://github.com/argoproj/argo-cd/issues/4622)
+* Git tags and branches autocompletion [#4713](https://github.com/argoproj/argo-cd/issues/4713)
+* Project Details Page [#4400](https://github.com/argoproj/argo-cd/issues/4400)
+* New version information panel [#4376](https://github.com/argoproj/argo-cd/issues/4376)
+* Progress Indicators [#4411](https://github.com/argoproj/argo-cd/issues/4411)
+* External links annotations [#4380](https://github.com/argoproj/argo-cd/issues/4380) and more!
+
+## Config Management Tools Enhancements
+
+* OCI Based Repositories [#4018](https://github.com/argoproj/argo-cd/issues/4018)
+* Configurable Helm Versions [#4111](https://github.com/argoproj/argo-cd/issues/4111)
+
+## Bug fixes and under the hood changes
+
+In addition to new features and enhancements, we’ve fixed more than 50 bugs and upgraded third-party components and libraries that Argo CD relies on.
+
+## v1.7.9 (2020-11-17)
+
+- fix: improve commit verification tolerance (#4825)
+- fix: argocd diff --local should not print data of local secrets (#4850)
+- fix(ui): stack overflow crash of resource tree view for large applications (#4685)
+- chore: Update golang to v1.14.12 [backport to release-1.7] (#4834)
+- chore: Update redis to 5.0.10 (#4767)
+- chore: Replace deprecated GH actions directives for integration tests (#4589)
+
+## v1.7.8 (2020-10-15)
+
+- fix(logging.go): changing marshaler for JSON logging to use gogo (#4319)
+- fix: login with apiKey capability (#4557)
+- fix: api-server should not try creating default project it is exists already (#4517)
+- fix: JS error on application list page if app has no namespace (#4499)
+
+
+## v1.7.7 (2020-09-28)
+
+- fix: Support transition from a git managed namespace to auto create (#4401)
+- fix: reduce memory spikes during cluster cache refresh (#4298)
+- fix: No error/warning condition if application destination namespace not monitored by Argo CD (#4329)
+- fix: Fix local diff/sync of apps using cluster name (#4201)
+
+## v1.7.6 (2020-09-18)
+
+- fix: Added cluster authentication to AKS clusters (#4265)
+- fix: swagger UI stuck loading (#4377)
+- fix: prevent 'argocd app sync' hangs if sync is completed too quickly (#4373)
+- fix: argocd app wait/sync might stuck (#4350)
+- fix: failed syncs are not retried soon enough (#4353)
+
+## v1.7.5 (2020-09-15)
+
+- fix: app create with -f should not ignore other options (#4322)
+- fix: limit concurrent list requests accross all clusters (#4328)
+- fix: fix possible deadlock in /v1/api/stream/applications and /v1/api/application APIs (#4315)
+- fix: WatchResourceTree does not enforce RBAC (#4311)
+- fix: app refresh API should use app resource version (#4303)
+- fix: use informer instead of k8s watch to ensure app is refreshed (#4290)
+
+
+## v1.7.4 (2020-09-04)
+
+- fix: automatically stop watch API requests when page is hidden (#4269)
+- fix: upgrade gitops-engine dependency (issues #4242, #1881) (#4268)
+- fix: application stream API should not return 'ADDED' events if resource version is provided (#4260)
+- fix: return parsing error (#3942)
+- fix: JS error when using cluster filter in the /application view (#4247)
+- fix: improve applications list page client side performance (#4244)
+
+## v1.7.3 (2020-09-01)
+
+- fix: application details page crash when app is deleted (#4229)
+- fix: api-server unnecessary normalize projects on every start (#4219)
+- fix: load only project names in UI (#4217)
+- fix: Re-create already initialized ARGOCD_GNUPGHOME on startup (#4214) (#4223)
+- fix: Add openshift as a dex connector type which requires a redirectURI (#4222)
+- fix: Replace status.observedAt with redis pub/sub channels for resource tree updates (#1340) (#4208)
+- fix: cache inconsistency of child resources (#4053) (#4202)
+- fix: do not include kube-api check in application liveness flow (#4163)
+
+## v1.7.2 (2020-08-27)
+
+- fix: Sync hangs with cert-manager on latest RC (#4105)
+- fix: support for PKCE for cli login (#2932)
+
+## v1.7.2 (2020-08-25)
+
+- fix: Unable to create project JWT token on K8S v1.15 (#4165)
+- fix: Argo CD does not exclude creationTimestamp from diffing (#4157)
+
+## v1.7.0 (2020-08-24)
+
+### GnuPG Signature Verification
+
+The feature allows to only sync against commits that are signed in Git using GnuPG. The list of public 
+GPG keys required for verification is configured at the system level and can be managed using Argo CD CLI or Web user interface.
+The keys management is integrated with Argo CD SSO and access control system (e.g. `argocd gpg add --from <path-to-key>`)
+
+The signature verification is enabled on the project level. The ApplicationProject CRD has a new signatureKeys field that includes
+a list of imported public GPG keys. Argo CD will verify the commit signature by these keys for every project application.
+
+### Cluster Management Enhancements
+
+The feature allows using the cluster name instead of the URL to specify the application destination cluster.
+Additionally, the cluster CLI and Web user interface have been improved. Argo CD operators now can view and edit cluster
+details using the Cluster Details page. The page includes cluster settings details as well as runtime information such
+as the number of monitored Kubernetes resources.
+
+### Diffing And Synchronization Usability
+
+* **Diffing logic improvement** Argo CD performs client-side resource diffing to detect deviations and present detected
+differences in the UI and CLI. The 1.7 release aligns a comparison algorithm with server-side Kubernetes implementation
+and removes inaccuracies in some edge cases.
+
+* **Helm Hooks Compatibility** The improvement removes the discrepancy between the way how Argo CD and Helm deletes
+hooks resources. This significantly improves the compatibility and enables additional use cases.
+
+* **Namespace Auto-Creation** With a new option for applications Argo CD will ensure that namespace specified as the
+application destination exists in the destination cluster. 
+
+* **Failed Sync Retry** This feature enables retrying of failed synchronization attempts during both manually-triggered
+and automated synchronization.
+
+### Orphaned Resources Monitoring Enhancement
+
+The enhancement allows configuring an exception list in Orphaned Resources settings to avoid false alarms.
+
+## v1.6.2 (2020-08-01)
+
+- feat: adding validate for app create and app set (#4016)
+- fix: use glob matcher in casbin built-in model (#3966)
+- fix: Normalize Helm chart path when chart name contains a slash (#3987)
+- fix: allow duplicates when using generateName (#3878)
+- fix: nil pointer dereference while syncing an app (#3915)
+
 ## v1.6.1 (2020-06-18)
 
 - fix: User unable to generate project token even if account has appropriate permissions (#3804)

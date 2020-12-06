@@ -9,13 +9,14 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/argoproj/gitops-engine/pkg/utils/io"
 	"github.com/pkg/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
+
+	"github.com/argoproj/argo-cd/util/io"
 )
 
 func PortForward(podSelector string, targetPort int, namespace string) (int, error) {
@@ -40,7 +41,7 @@ func PortForward(podSelector string, targetPort int, namespace string) (int, err
 		return -1, err
 	}
 
-	pods, err := clientSet.CoreV1().Pods(namespace).List(v1.ListOptions{
+	pods, err := clientSet.CoreV1().Pods(namespace).List(context.Background(), v1.ListOptions{
 		LabelSelector: podSelector,
 	})
 	if err != nil {

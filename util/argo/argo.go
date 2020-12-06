@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/argoproj/gitops-engine/pkg/utils/io"
 	"github.com/argoproj/gitops-engine/pkg/utils/kube"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
@@ -27,6 +26,8 @@ import (
 	"github.com/argoproj/argo-cd/util/db"
 	"github.com/argoproj/argo-cd/util/git"
 	"github.com/argoproj/argo-cd/util/helm"
+	"github.com/argoproj/argo-cd/util/io"
+	"github.com/argoproj/argo-cd/util/settings"
 )
 
 const (
@@ -62,6 +63,21 @@ func FilterByProjects(apps []argoappv1.Application, projects []string) []argoapp
 
 }
 
+// FilterByName returns an application
+func FilterByName(apps []argoappv1.Application, name string) ([]argoappv1.Application, error) {
+	if name == "" {
+		return apps, nil
+	}
+	items := make([]argoappv1.Application, 0)
+	for i := 0; i < len(apps); i++ {
+		if apps[i].Name == name {
+			items = append(items, apps[i])
+			return items, nil
+		}
+	}
+	return items, status.Errorf(codes.NotFound, "application '%s' not found", name)
+}
+
 // RefreshApp updates the refresh annotation of an application to coerce the controller to process it
 func RefreshApp(appIf v1alpha1.ApplicationInterface, name string, refreshType argoappv1.RefreshType) (*argoappv1.Application, error) {
 	metadata := map[string]interface{}{
@@ -77,7 +93,7 @@ func RefreshApp(appIf v1alpha1.ApplicationInterface, name string, refreshType ar
 		return nil, err
 	}
 	for attempt := 0; attempt < 5; attempt++ {
-		app, err := appIf.Patch(name, types.MergePatchType, patch)
+		app, err := appIf.Patch(context.Background(), name, types.MergePatchType, patch, metav1.PatchOptions{})
 		if err != nil {
 			if !apierr.IsConflict(err) {
 				return nil, err
@@ -102,7 +118,7 @@ func WaitForRefresh(ctx context.Context, appIf v1alpha1.ApplicationInterface, na
 	ch := kube.WatchWithRetry(ctx, func() (i watch.Interface, e error) {
 		fieldSelector := fields.ParseSelectorOrDie(fmt.Sprintf("metadata.name=%s", name))
 		listOpts := metav1.ListOptions{FieldSelector: fieldSelector.String()}
-		return appIf.Watch(listOpts)
+		return appIf.Watch(ctx, listOpts)
 	})
 	for next := range ch {
 		if next.Error != nil {
@@ -123,12 +139,18 @@ func WaitForRefresh(ctx context.Context, appIf v1alpha1.ApplicationInterface, na
 	return nil, fmt.Errorf("application refresh deadline exceeded")
 }
 
-func TestRepoWithKnownType(repo *argoappv1.Repository, isHelm bool) error {
+func TestRepoWithKnownType(repo *argoappv1.Repository, isHelm bool, isHelmOci bool) error {
 	repo = repo.DeepCopy()
 	if isHelm {
 		repo.Type = "helm"
 	} else {
 		repo.Type = "git"
+	}
+
+	if isHelmOci {
+		repo.EnableOCI = true
+	} else {
+		repo.EnableOCI = false
 	}
 	return TestRepo(repo)
 }
@@ -139,8 +161,13 @@ func TestRepo(repo *argoappv1.Repository) error {
 			return git.TestRepo(repo.Repo, repo.GetGitCreds(), repo.IsInsecure(), repo.IsLFSEnabled())
 		},
 		"helm": func() error {
-			_, err := helm.NewClient(repo.Repo, repo.GetHelmCreds()).GetIndex()
-			return err
+			if repo.EnableOCI {
+				_, err := helm.NewClient(repo.Repo, repo.GetHelmCreds(), repo.EnableOCI).TestHelmOCI()
+				return err
+			} else {
+				_, err := helm.NewClient(repo.Repo, repo.GetHelmCreds(), repo.EnableOCI).GetIndex()
+				return err
+			}
 		},
 	}
 	if check, ok := checks[repo.Type]; ok {
@@ -185,7 +212,7 @@ func ValidateRepo(
 	}
 
 	repoAccessible := false
-	err = TestRepoWithKnownType(repo, app.Spec.Source.IsHelm())
+	err = TestRepoWithKnownType(repo, app.Spec.Source.IsHelm(), app.Spec.Source.IsHelmOci())
 	if err != nil {
 		conditions = append(conditions, argoappv1.ApplicationCondition{
 			Type:    argoappv1.ApplicationConditionInvalidSpecError,
@@ -351,8 +378,12 @@ func APIGroupsToVersions(apiGroups []metav1.APIGroup) []string {
 }
 
 // GetAppProject returns a project from an application
-func GetAppProject(spec *argoappv1.ApplicationSpec, projLister applicationsv1.AppProjectLister, ns string) (*argoappv1.AppProject, error) {
-	return projLister.AppProjects(ns).Get(spec.GetProject())
+func GetAppProject(spec *argoappv1.ApplicationSpec, projLister applicationsv1.AppProjectLister, ns string, settingsManager *settings.SettingsManager) (*argoappv1.AppProject, error) {
+	projOrig, err := projLister.AppProjects(ns).Get(spec.GetProject())
+	if err != nil {
+		return nil, err
+	}
+	return GetAppVirtualProject(projOrig, projLister, settingsManager)
 }
 
 // verifyGenerateManifests verifies a repo path can generate manifests
@@ -411,7 +442,7 @@ func verifyGenerateManifests(
 // SetAppOperation updates an application with the specified operation, retrying conflict errors
 func SetAppOperation(appIf v1alpha1.ApplicationInterface, appName string, op *argoappv1.Operation) (*argoappv1.Application, error) {
 	for {
-		a, err := appIf.Get(appName, metav1.GetOptions{})
+		a, err := appIf.Get(context.Background(), appName, metav1.GetOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -420,7 +451,7 @@ func SetAppOperation(appIf v1alpha1.ApplicationInterface, appName string, op *ar
 		}
 		a.Operation = op
 		a.Status.OperationState = nil
-		a, err = appIf.Update(a)
+		a, err = appIf.Update(context.Background(), a, metav1.UpdateOptions{})
 		if op.Sync == nil {
 			return nil, status.Errorf(codes.InvalidArgument, "Operation unspecified")
 		}
@@ -466,7 +497,11 @@ func NormalizeApplicationSpec(spec *argoappv1.ApplicationSpec) *argoappv1.Applic
 		spec.Source.Ksonnet = nil
 	}
 	if spec.Source.Directory != nil && spec.Source.Directory.IsZero() {
-		spec.Source.Directory = nil
+		if spec.Source.Directory.Exclude != "" {
+			spec.Source.Directory = &argoappv1.ApplicationSourceDirectory{Exclude: spec.Source.Directory.Exclude}
+		} else {
+			spec.Source.Directory = nil
+		}
 	}
 	return spec
 }
@@ -488,4 +523,74 @@ func getDestinationServer(ctx context.Context, db db.ArgoDB, clusterName string)
 		return "", fmt.Errorf("there are no clusters with this name: %s", clusterName)
 	}
 	return servers[0], nil
+}
+
+func GetGlobalProjects(proj *argoappv1.AppProject, projLister applicationsv1.AppProjectLister, settingsManager *settings.SettingsManager) []*argoappv1.AppProject {
+	gps, err := settingsManager.GetGlobalProjectsSettings()
+	globalProjects := make([]*argoappv1.AppProject, 0)
+
+	if err != nil {
+		log.Warnf("Failed to get global project settings: %v", err)
+		return globalProjects
+	}
+
+	for _, gp := range gps {
+		//The project itself is not its own the global project
+		if proj.Name == gp.ProjectName {
+			continue
+		}
+
+		selector, err := metav1.LabelSelectorAsSelector(&gp.LabelSelector)
+		if err != nil {
+			break
+		}
+		//Get projects which match the label selector, then see if proj is a match
+		projList, err := projLister.AppProjects(proj.Namespace).List(selector)
+		if err != nil {
+			break
+		}
+		var matchMe bool
+		for _, item := range projList {
+			if item.Name == proj.Name {
+				matchMe = true
+				break
+			}
+		}
+		if !matchMe {
+			break
+		}
+		//If proj is a match for this global project setting, then it is its global project
+		globalProj, err := projLister.AppProjects(proj.Namespace).Get(gp.ProjectName)
+		if err != nil {
+			break
+		}
+		globalProjects = append(globalProjects, globalProj)
+
+	}
+	return globalProjects
+}
+
+func GetAppVirtualProject(proj *argoappv1.AppProject, projLister applicationsv1.AppProjectLister, settingsManager *settings.SettingsManager) (*argoappv1.AppProject, error) {
+	virtualProj := proj.DeepCopy()
+	globalProjects := GetGlobalProjects(proj, projLister, settingsManager)
+
+	for _, gp := range globalProjects {
+		virtualProj = mergeVirtualProject(virtualProj, gp)
+	}
+	return virtualProj, nil
+}
+
+func mergeVirtualProject(proj *argoappv1.AppProject, globalProj *argoappv1.AppProject) *argoappv1.AppProject {
+	if globalProj == nil {
+		return proj
+	}
+	proj.Spec.ClusterResourceWhitelist = append(proj.Spec.ClusterResourceWhitelist, globalProj.Spec.ClusterResourceWhitelist...)
+	proj.Spec.ClusterResourceBlacklist = append(proj.Spec.ClusterResourceBlacklist, globalProj.Spec.ClusterResourceBlacklist...)
+
+	proj.Spec.NamespaceResourceWhitelist = append(proj.Spec.NamespaceResourceWhitelist, globalProj.Spec.NamespaceResourceWhitelist...)
+	proj.Spec.NamespaceResourceBlacklist = append(proj.Spec.NamespaceResourceBlacklist, globalProj.Spec.NamespaceResourceBlacklist...)
+
+	proj.Spec.SyncWindows = append(proj.Spec.SyncWindows, globalProj.Spec.SyncWindows...)
+
+	return proj
 }

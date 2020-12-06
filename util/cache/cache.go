@@ -1,12 +1,13 @@
 package cache
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
 	"time"
 
-	"github.com/go-redis/redis"
+	"github.com/go-redis/redis/v8"
 	"github.com/spf13/cobra"
 
 	"github.com/argoproj/argo-cd/common"
@@ -78,13 +79,13 @@ type Cache struct {
 }
 
 func (c *Cache) SetItem(key string, item interface{}, expiration time.Duration, delete bool) error {
-	if item == nil {
-		return fmt.Errorf("cannot set item to nil for key %s", key)
-	}
 	key = fmt.Sprintf("%s|%s", key, common.CacheVersion)
 	if delete {
 		return c.client.Delete(key)
 	} else {
+		if item == nil {
+			return fmt.Errorf("cannot set item to nil for key %s", key)
+		}
 		return c.client.Set(&Item{Object: item, Key: key, Expiration: expiration})
 	}
 }
@@ -95,4 +96,12 @@ func (c *Cache) GetItem(key string, item interface{}) error {
 	}
 	key = fmt.Sprintf("%s|%s", key, common.CacheVersion)
 	return c.client.Get(key, item)
+}
+
+func (c *Cache) OnUpdated(ctx context.Context, key string, callback func() error) error {
+	return c.client.OnUpdated(ctx, fmt.Sprintf("%s|%s", key, common.CacheVersion), callback)
+}
+
+func (c *Cache) NotifyUpdated(key string) error {
+	return c.client.NotifyUpdated(fmt.Sprintf("%s|%s", key, common.CacheVersion))
 }
